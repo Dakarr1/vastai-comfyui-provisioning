@@ -11,8 +11,7 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    #"package-1"
-    #"package-2"
+    "transformers==4.57.3"
 )
 
 NODES=(
