@@ -3,7 +3,59 @@
 source /venv/main/bin/activate
 COMFYUI_DIR=${WORKSPACE}/ComfyUI
 
-# Packages are installed after nodes so we can fix them...
+# ==================== PYTHON HTTP SERVER SETUP (NA POCZĄTKU) ====================
+
+function setup_output_http_server() {
+    echo "=========================================="
+    echo "Setting up Python HTTP server for outputs"
+    echo "=========================================="
+    
+    # Upewnij się że katalog output istnieje
+    mkdir -p ${COMFYUI_DIR}/output
+    
+    # Utwórz systemd service dla HTTP servera
+    cat > /etc/systemd/system/comfyui-output-server.service << 'EOF'
+[Unit]
+Description=ComfyUI Output HTTP Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/workspace/ComfyUI/output
+ExecStart=/usr/bin/python3 -m http.server 8081 --bind 0.0.0.0
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Przeładuj systemd i włącz service
+    systemctl daemon-reload
+    systemctl enable comfyui-output-server.service
+    systemctl start comfyui-output-server.service
+    
+    # Czekaj chwilę i sprawdź status
+    sleep 3
+    
+    if systemctl is-active --quiet comfyui-output-server.service; then
+        echo "✅ Output HTTP server is running on port 8081"
+        echo "   Access at: http://PUBLIC_IP:PUBLIC_PORT_8081/"
+        echo "   Service status: $(systemctl status comfyui-output-server.service --no-pager | grep Active)"
+    else
+        echo "⚠️ Output HTTP server may have issues starting"
+        echo "   This is normal if ComfyUI output directory doesn't exist yet"
+        echo "   Service will auto-restart and work after first generation"
+        systemctl status comfyui-output-server.service --no-pager || true
+    fi
+    
+    echo "=========================================="
+}
+
+# ==================== PACKAGE DEFINITIONS ====================
 
 APT_PACKAGES=(
     #"package-1"
@@ -63,6 +115,7 @@ DIFFUSION_MODELS=(
 
 function provisioning_start() {
     provisioning_print_header
+    setup_output_http_server  # ← DODANE: Setup HTTP server PRZED wszystkim
     provisioning_get_apt_packages
     provisioning_get_nodes
     provisioning_get_pip_packages
