@@ -3,7 +3,7 @@
 source /venv/main/bin/activate
 COMFYUI_DIR=${WORKSPACE}/ComfyUI
 
-# ==================== PYTHON HTTP SERVER SETUP (NA POCZĄTKU) ====================
+# ==================== PYTHON HTTP SERVER SETUP ====================
 
 function setup_output_http_server() {
     echo "=========================================="
@@ -13,43 +13,36 @@ function setup_output_http_server() {
     # Upewnij się że katalog output istnieje
     mkdir -p ${COMFYUI_DIR}/output
     
-    # Utwórz systemd service dla HTTP servera
-    cat > /etc/systemd/system/comfyui-output-server.service << 'EOF'
-[Unit]
-Description=ComfyUI Output HTTP Server
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/workspace/ComfyUI/output
-ExecStart=/usr/bin/python3 -m http.server 8081 --bind 0.0.0.0
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
+    # Utwórz supervisord config dla HTTP servera
+    cat > /etc/supervisor/conf.d/comfyui-output-server.conf << 'EOF'
+[program:comfyui-output-server]
+command=/usr/bin/python3 -m http.server 8081 --bind 0.0.0.0
+directory=/workspace/ComfyUI/output
+autostart=true
+autorestart=true
+redirect_stderr=true
+stdout_logfile=/var/log/comfyui-output-server.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
+priority=999
 EOF
 
-    # Przeładuj systemd i włącz service
-    systemctl daemon-reload
-    systemctl enable comfyui-output-server.service
-    systemctl start comfyui-output-server.service
+    # Przeładuj supervisord config
+    supervisorctl reread
+    supervisorctl update
+    supervisorctl start comfyui-output-server
     
     # Czekaj chwilę i sprawdź status
     sleep 3
     
-    if systemctl is-active --quiet comfyui-output-server.service; then
-        echo "✅ Output HTTP server is running on port 8081"
+    if supervisorctl status comfyui-output-server | grep -q RUNNING; then
+        echo "✅ Output HTTP server is RUNNING on port 8081"
         echo "   Access at: http://PUBLIC_IP:PUBLIC_PORT_8081/"
-        echo "   Service status: $(systemctl status comfyui-output-server.service --no-pager | grep Active)"
+        supervisorctl status comfyui-output-server
     else
-        echo "⚠️ Output HTTP server may have issues starting"
-        echo "   This is normal if ComfyUI output directory doesn't exist yet"
-        echo "   Service will auto-restart and work after first generation"
-        systemctl status comfyui-output-server.service --no-pager || true
+        echo "⚠️ Output HTTP server status:"
+        supervisorctl status comfyui-output-server || true
+        echo "   Check logs: tail -f /var/log/comfyui-output-server.log"
     fi
     
     echo "=========================================="
@@ -115,7 +108,7 @@ DIFFUSION_MODELS=(
 
 function provisioning_start() {
     provisioning_print_header
-    setup_output_http_server  # ← DODANE: Setup HTTP server PRZED wszystkim
+    setup_output_http_server  # ← Setup HTTP server PRZED wszystkim
     provisioning_get_apt_packages
     provisioning_get_nodes
     provisioning_get_pip_packages
