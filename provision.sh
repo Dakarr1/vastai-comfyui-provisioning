@@ -13,7 +13,6 @@ MAX_RETRY_DELAY=60
 # Intelligent timeout calculation
 MIN_TIMEOUT=60
 MAX_TIMEOUT=1800  # 30 minutes
-SPEED_TEST_SAMPLES=3
 
 # Concurrent downloads
 MAX_CONCURRENT_DOWNLOADS=3
@@ -67,7 +66,7 @@ function log_speed() {
     echo "$*" >> "$DOWNLOAD_SPEEDS_LOG"
 }
 
-# ==================== NETWORK INTELLIGENCE ====================
+# ==================== NETWORK INTELLIGENCE (FIXED) ====================
 
 function measure_download_speed() {
     # Test download speed with small file from HuggingFace
@@ -76,18 +75,33 @@ function measure_download_speed() {
     
     log_info "Measuring network speed..."
     
-    local start_time=$(date +%s.%N)
+    local start_time=$(date +%s)
     if wget -q -O "$test_file" --timeout=30 "$test_url" 2>/dev/null; then
-        local end_time=$(date +%s.%N)
-        local file_size=$(stat -f%z "$test_file" 2>/dev/null || stat -c%s "$test_file" 2>/dev/null)
-        local duration=$(echo "$end_time - $start_time" | bc)
-        local speed_mbps=$(echo "scale=2; ($file_size / $duration) / 125000" | bc)  # Convert to Mbps
+        local end_time=$(date +%s)
+        local file_size=$(stat -c%s "$test_file" 2>/dev/null || stat -f%z "$test_file" 2>/dev/null)
+        local duration=$((end_time - start_time))
+        
+        # Avoid division by zero
+        if [[ $duration -lt 1 ]]; then
+            duration=1
+        fi
+        
+        # Speed in MB/s
+        local speed_mbs=$((file_size / duration / 1048576))
+        
+        # Convert to Mbps (multiply by 8)
+        local speed_mbps=$((speed_mbs * 8))
+        
+        # Minimum 10 Mbps
+        if [[ $speed_mbps -lt 10 ]]; then
+            speed_mbps=10
+        fi
         
         rm -f "$test_file"
         echo "$speed_mbps"
     else
         rm -f "$test_file"
-        echo "10"  # Default 10 Mbps if test fails
+        echo "50"  # Default 50 Mbps if test fails
     fi
 }
 
@@ -95,8 +109,12 @@ function calculate_intelligent_timeout() {
     local file_size_gb="$1"
     local network_speed_mbps="$2"
     
-    # Calculate expected time (GB * 8 * 1000 / Mbps) + 50% buffer
-    local expected_seconds=$(echo "scale=0; ($file_size_gb * 8000 / $network_speed_mbps) * 1.5" | bc)
+    # Convert GB to Mb (1 GB = 8192 Mb)
+    local file_size_mb=$((${file_size_gb%%.*} * 8192))
+    
+    # Calculate expected seconds with 50% buffer
+    # Time = (File Size in Mb / Speed in Mbps) * 1.5
+    local expected_seconds=$((file_size_mb * 3 / network_speed_mbps / 2))
     
     # Clamp between MIN and MAX
     if [[ $expected_seconds -lt $MIN_TIMEOUT ]]; then
@@ -112,11 +130,18 @@ function estimate_file_size() {
     local url="$1"
     
     # Try to get Content-Length from HEAD request
-    local size=$(curl -sI "$url" | grep -i content-length | awk '{print $2}' | tr -d '\r')
+    local size=$(curl -sI "$url" 2>/dev/null | grep -i content-length | awk '{print $2}' | tr -d '\r')
     
     if [[ -n "$size" && "$size" =~ ^[0-9]+$ ]]; then
-        # Convert to GB
-        echo "scale=2; $size / 1073741824" | bc
+        # Convert to GB (integer math)
+        local size_gb=$((size / 1073741824))
+        
+        # Minimum 1 GB
+        if [[ $size_gb -lt 1 ]]; then
+            size_gb=1
+        fi
+        
+        echo "$size_gb"
     else
         # Default estimate: 5GB for safetensors
         echo "5"
@@ -124,27 +149,6 @@ function estimate_file_size() {
 }
 
 # ==================== INTEGRITY VERIFICATION ====================
-
-function get_file_checksum_url() {
-    local file_url="$1"
-    
-    # HuggingFace provides checksums via API
-    if [[ "$file_url" =~ huggingface\.co ]]; then
-        # Extract repo and filename
-        if [[ "$file_url" =~ huggingface\.co/([^/]+)/([^/]+)/resolve/([^/]+)/(.+) ]]; then
-            local repo_owner="${BASH_REMATCH[1]}"
-            local repo_name="${BASH_REMATCH[2]}"
-            local revision="${BASH_REMATCH[3]}"
-            local filepath="${BASH_REMATCH[4]}"
-            
-            # HF stores sha256 in .gitattributes or we can compute from LFS pointer
-            echo "${file_url}.sha256"  # Simplified - HF doesn't expose directly
-            return 0
-        fi
-    fi
-    
-    return 1
-}
 
 function verify_file_integrity() {
     local filepath="$1"
@@ -155,7 +159,7 @@ function verify_file_integrity() {
     fi
     
     # Check minimum file size
-    local filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null)
+    local filesize=$(stat -c%s "$filepath" 2>/dev/null || stat -f%z "$filepath" 2>/dev/null)
     if [[ $filesize -lt $MIN_FILE_SIZE_BYTES ]]; then
         log_warning "File too small: $(basename "$filepath") - ${filesize} bytes"
         return 1
@@ -195,13 +199,13 @@ function cleanup_corrupted_files() {
     
     # Remove files smaller than MIN_FILE_SIZE
     while IFS= read -r file; do
-        local size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null)
+        local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
         if [[ $size -lt $MIN_FILE_SIZE_BYTES ]]; then
             log_warning "Removing corrupted file: $(basename "$file") (${size} bytes)"
             rm -f "$file"
             ((cleaned++))
         fi
-    done < <(find "$dir" -type f -name "*.safetensors" -o -name "*.bin" -o -name "*.ckpt" 2>/dev/null)
+    done < <(find "$dir" -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.ckpt" \) 2>/dev/null)
     
     if [[ $cleaned -gt 0 ]]; then
         log_info "Cleaned ${cleaned} corrupted file(s)"
@@ -226,7 +230,7 @@ function download_with_aria2() {
         "--timeout=${timeout}"
         "--connect-timeout=30"
         "--max-file-not-found=3"
-        "--console-log-level=warn"
+        "--console-log-level=error"
         "--summary-interval=0"
         "--dir=${output_dir}"
         "--out=${output_file}"
@@ -239,8 +243,8 @@ function download_with_aria2() {
         aria2_opts+=("--header=Authorization: Bearer ${auth_token}")
     fi
     
-    aria2c "${aria2_opts[@]}" "$url"
-    return $?
+    aria2c "${aria2_opts[@]}" "$url" 2>&1 | grep -v "INFO" | tee -a "$PROVISION_LOG"
+    return ${PIPESTATUS[0]}
 }
 
 function download_with_hf_cli() {
@@ -263,16 +267,20 @@ function download_with_hf_cli() {
             --revision "$revision" \
             --local-dir "$output_dir" \
             --local-dir-use-symlinks False \
-            --resume-download \
-            --quiet 2>&1 | tee -a "$PROVISION_LOG"
+            --resume-download 2>&1 | grep -v "FutureWarning" | grep -v "⚠️" | tee -a "$PROVISION_LOG"
         
         local exit_code=${PIPESTATUS[0]}
         
-        # HF CLI downloads to filename directly, not output_file
-        if [[ $exit_code -eq 0 && -f "${output_dir}/${filename}" ]]; then
-            # Move to expected location if different
-            if [[ "${filename}" != "${output_file}" ]]; then
-                mv "${output_dir}/${filename}" "${output_dir}/${output_file}"
+        # HF CLI downloads to original path structure
+        local downloaded_file="${output_dir}/${filename}"
+        
+        if [[ $exit_code -eq 0 && -f "$downloaded_file" ]]; then
+            # Move to flat structure if needed
+            if [[ "$downloaded_file" != "${output_dir}/${output_file}" ]]; then
+                mv "$downloaded_file" "${output_dir}/${output_file}" 2>/dev/null || true
+                
+                # Clean up empty directories
+                find "$output_dir" -type d -empty -delete 2>/dev/null || true
             fi
             return 0
         fi
@@ -293,12 +301,11 @@ function provisioning_download_with_retry() {
     local temp_filepath="${filepath}.tmp"
     
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log_info "Downloading: ${filename}"
-    log_info "URL: ${url}"
+    log_info "Target: ${filename}"
     
     # Check if already exists and valid
     if [[ -f "$filepath" ]] && verify_file_integrity "$filepath"; then
-        log_info "✓ File already exists and verified: ${filename}"
+        log_info "✓ Already exists: ${filename}"
         return 0
     fi
     
@@ -317,7 +324,7 @@ function provisioning_download_with_retry() {
     if [[ ! -f /tmp/network_speed_cached ]]; then
         local network_speed=$(measure_download_speed)
         echo "$network_speed" > /tmp/network_speed_cached
-        log_info "Network speed: ${network_speed} Mbps"
+        log_info "Network: ${network_speed} Mbps"
     else
         local network_speed=$(cat /tmp/network_speed_cached)
     fi
@@ -325,7 +332,7 @@ function provisioning_download_with_retry() {
     # Estimate file size and calculate intelligent timeout
     local estimated_size=$(estimate_file_size "$url")
     local intelligent_timeout=$(calculate_intelligent_timeout "$estimated_size" "$network_speed")
-    log_info "Estimated size: ${estimated_size} GB, Timeout: ${intelligent_timeout}s"
+    log_info "Size: ~${estimated_size}GB | Timeout: ${intelligent_timeout}s"
     
     # Retry loop with exponential backoff
     local attempt=1
@@ -339,7 +346,6 @@ function provisioning_download_with_retry() {
         
         # Try HF CLI first if HuggingFace URL
         if [[ "$url" =~ huggingface\.co ]]; then
-            log_info "Method: HuggingFace CLI (hf_transfer)"
             if download_with_hf_cli "$url" "$dir" "$filename"; then
                 success=true
             fi
@@ -347,7 +353,7 @@ function provisioning_download_with_retry() {
         
         # Fallback to aria2
         if [[ "$success" == "false" ]]; then
-            log_info "Method: aria2c (multi-connection)"
+            log_info "Fallback: aria2c"
             if download_with_aria2 "$url" "$dir" "$filename" "$intelligent_timeout" "$auth_token"; then
                 success=true
             fi
@@ -358,27 +364,23 @@ function provisioning_download_with_retry() {
         
         # Verify download
         if [[ "$success" == "true" ]] && verify_file_integrity "$filepath"; then
-            local filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null)
-            local speed_mbps=$(echo "scale=2; ($filesize / $download_duration) / 125000" | bc)
+            local filesize=$(stat -c%s "$filepath" 2>/dev/null || stat -f%z "$filepath" 2>/dev/null)
+            local size_mb=$((filesize / 1048576))
             
-            log_info "✅ SUCCESS: ${filename}"
-            log_info "   Size: $((filesize / 1048576)) MB"
-            log_info "   Time: ${download_duration}s"
-            log_info "   Speed: ${speed_mbps} Mbps"
-            log_speed "${filename},${filesize},${download_duration},${speed_mbps}"
+            log_info "✅ SUCCESS: ${filename} (${size_mb}MB in ${download_duration}s)"
             
-            # Clean up any temp files
+            # Clean up temp files
             rm -f "$temp_filepath" "${filepath}.aria2"
             
             return 0
         fi
         
         # Download failed or corrupted
-        log_warning "Attempt ${attempt} failed or file corrupted"
+        log_warning "Attempt ${attempt} failed"
         rm -f "$filepath" "$temp_filepath" "${filepath}.aria2"
         
         if [[ $attempt -lt $MAX_RETRIES ]]; then
-            log_info "Waiting ${retry_delay}s before retry..."
+            log_info "Retry in ${retry_delay}s..."
             sleep $retry_delay
             
             # Exponential backoff with cap
@@ -391,14 +393,14 @@ function provisioning_download_with_retry() {
         ((attempt++))
     done
     
-    log_error "❌ FAILED after ${MAX_RETRIES} attempts: ${filename}"
+    log_error "❌ FAILED: ${filename}"
     return 1
 }
 
 # ==================== PYTHON HTTP SERVER SETUP ====================
 
 function setup_output_http_server() {
-    log_info "Setting up Python HTTP server for outputs"
+    log_info "Setting up HTTP server..."
     
     mkdir -p ${COMFYUI_DIR}/output
     
@@ -422,15 +424,13 @@ EOF
     sleep 2
     
     if supervisorctl status comfyui-output-server 2>/dev/null | grep -q RUNNING; then
-        log_info "✅ HTTP server running on port 8081"
+        log_info "✅ HTTP server: port 8081"
     fi
 }
 
 # ==================== PACKAGE DEFINITIONS ====================
 
-APT_PACKAGES=(
-    #"package-1"
-)
+APT_PACKAGES=()
 
 PIP_PACKAGES=(
     "transformers==4.57.3"
@@ -486,15 +486,10 @@ function provisioning_start() {
     # Clean corrupted files before downloading
     cleanup_corrupted_files "${COMFYUI_DIR}/models"
     
-    provisioning_get_files "${COMFYUI_DIR}/models/checkpoints" "${CHECKPOINT_MODELS[@]}"
-    provisioning_get_files "${COMFYUI_DIR}/models/unet" "${UNET_MODELS[@]}"
     provisioning_get_files "${COMFYUI_DIR}/models/loras" "${LORA_MODELS[@]}"
     provisioning_get_files "${COMFYUI_DIR}/models/vae" "${VAE_MODELS[@]}"
     provisioning_get_files "${COMFYUI_DIR}/models/text_encoders" "${TEXT_ENCODER_MODELS[@]}"
     provisioning_get_files "${COMFYUI_DIR}/models/diffusion_models" "${DIFFUSION_MODELS[@]}"
-    provisioning_get_files "${COMFYUI_DIR}/models/controlnet" "${CONTROLNET_MODELS[@]}"
-    provisioning_get_files "${COMFYUI_DIR}/models/upscale_models" "${ESRGAN_MODELS[@]}"
-    provisioning_get_files "${COMFYUI_DIR}/models/latent_upscale_models" "${LATENT_UPSCALE_MODELS[@]}"
     
     log_info "=========================================="
     log_info "  PROVISIONING COMPLETE"
@@ -502,14 +497,14 @@ function provisioning_start() {
 }
 
 function provisioning_get_apt_packages() {
-    if [[ -n ${APT_PACKAGES[@]} ]]; then
+    if [[ ${#APT_PACKAGES[@]} -gt 0 ]]; then
         log_info "Installing APT packages..."
         apt-get update -qq && apt-get install -y ${APT_PACKAGES[@]} > /dev/null 2>&1
     fi
 }
 
 function provisioning_get_pip_packages() {
-    if [[ -n ${PIP_PACKAGES[@]} ]]; then
+    if [[ ${#PIP_PACKAGES[@]} -gt 0 ]]; then
         log_info "Installing PIP packages..."
         pip install --no-cache-dir ${PIP_PACKAGES[@]} > /dev/null 2>&1
     fi
@@ -523,8 +518,8 @@ function provisioning_get_nodes() {
         if [[ -d $path ]]; then
             log_info "Node exists: ${dir}"
         else
-            log_info "Cloning node: ${repo}"
-            git clone "${repo}" "${path}" --recursive --quiet
+            log_info "Cloning: ${dir}"
+            git clone "${repo}" "${path}" --recursive --quiet 2>&1 | tee -a "$PROVISION_LOG"
             
             if [[ -f "${path}/requirements.txt" ]]; then
                 pip install --no-cache-dir -r "${path}/requirements.txt" > /dev/null 2>&1
@@ -545,7 +540,7 @@ function provisioning_get_files() {
         return 0
     fi
     
-    log_info "Processing ${#arr[@]} file(s) for ${dir}"
+    log_info "Target dir: ${dir} (${#arr[@]} files)"
     
     for url in "${arr[@]}"; do
         provisioning_download_with_retry "$url" "$dir"
