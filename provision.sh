@@ -66,9 +66,10 @@ function log_speed() {
     echo "$*" >> "$DOWNLOAD_SPEEDS_LOG"
 }
 
-# ==================== NETWORK INTELLIGENCE ====================
+# ==================== NETWORK INTELLIGENCE (FIXED) ====================
 
 function measure_download_speed() {
+    # Test download speed with small file from HuggingFace
     local test_url="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/model_card/model_card_annotated.png"
     local test_file="/tmp/speed_test_$$"
     
@@ -80,13 +81,18 @@ function measure_download_speed() {
         local file_size=$(stat -c%s "$test_file" 2>/dev/null || stat -f%z "$test_file" 2>/dev/null)
         local duration=$((end_time - start_time))
         
+        # Avoid division by zero
         if [[ $duration -lt 1 ]]; then
             duration=1
         fi
         
+        # Speed in MB/s
         local speed_mbs=$((file_size / duration / 1048576))
+        
+        # Convert to Mbps (multiply by 8)
         local speed_mbps=$((speed_mbs * 8))
         
+        # Minimum 10 Mbps
         if [[ $speed_mbps -lt 10 ]]; then
             speed_mbps=10
         fi
@@ -95,7 +101,7 @@ function measure_download_speed() {
         echo "$speed_mbps"
     else
         rm -f "$test_file"
-        echo "50"
+        echo "50"  # Default 50 Mbps if test fails
     fi
 }
 
@@ -103,18 +109,11 @@ function calculate_intelligent_timeout() {
     local file_size_gb="$1"
     local network_speed_mbps="$2"
     
-    # Remove decimal if present
-    file_size_gb=${file_size_gb%%.*}
-    
-    # Default to 1 if 0 or empty
-    if [[ -z "$file_size_gb" || "$file_size_gb" -eq 0 ]]; then
-        file_size_gb=1
-    fi
-    
     # Convert GB to Mb (1 GB = 8192 Mb)
-    local file_size_mb=$((file_size_gb * 8192))
+    local file_size_mb=$((${file_size_gb%%.*} * 8192))
     
     # Calculate expected seconds with 50% buffer
+    # Time = (File Size in Mb / Speed in Mbps) * 1.5
     local expected_seconds=$((file_size_mb * 3 / network_speed_mbps / 2))
     
     # Clamp between MIN and MAX
@@ -130,17 +129,21 @@ function calculate_intelligent_timeout() {
 function estimate_file_size() {
     local url="$1"
     
+    # Try to get Content-Length from HEAD request
     local size=$(curl -sI "$url" 2>/dev/null | grep -i content-length | awk '{print $2}' | tr -d '\r')
     
     if [[ -n "$size" && "$size" =~ ^[0-9]+$ ]]; then
+        # Convert to GB (integer math)
         local size_gb=$((size / 1073741824))
         
+        # Minimum 1 GB
         if [[ $size_gb -lt 1 ]]; then
             size_gb=1
         fi
         
         echo "$size_gb"
     else
+        # Default estimate: 5GB for safetensors
         echo "5"
     fi
 }
@@ -155,12 +158,14 @@ function verify_file_integrity() {
         return 1
     fi
     
+    # Check minimum file size
     local filesize=$(stat -c%s "$filepath" 2>/dev/null || stat -f%z "$filepath" 2>/dev/null)
     if [[ $filesize -lt $MIN_FILE_SIZE_BYTES ]]; then
         log_warning "File too small: $(basename "$filepath") - ${filesize} bytes"
         return 1
     fi
     
+    # If we have expected checksum, verify
     if [[ -n "$expected_checksum" && "$VERIFY_INTEGRITY" == "true" ]]; then
         log_info "Verifying checksum for $(basename "$filepath")..."
         local actual_checksum=$(sha256sum "$filepath" | awk '{print $1}')
@@ -174,6 +179,7 @@ function verify_file_integrity() {
         fi
     fi
     
+    # Fallback: file exists and size is reasonable
     log_info "✓ File size check passed: $(basename "$filepath") - ${filesize} bytes"
     return 0
 }
@@ -187,9 +193,11 @@ function cleanup_corrupted_files() {
     
     local cleaned=0
     
+    # Remove temp files
     find "$dir" -name "*.tmp" -delete 2>/dev/null
     find "$dir" -name "*.aria2" -delete 2>/dev/null
     
+    # Remove files smaller than MIN_FILE_SIZE
     while IFS= read -r file; do
         local size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
         if [[ $size -lt $MIN_FILE_SIZE_BYTES ]]; then
@@ -204,7 +212,7 @@ function cleanup_corrupted_files() {
     fi
 }
 
-# ==================== INTELLIGENT DOWNLOAD FUNCTIONS ====================
+# ==================== INTELLIGENT DOWNLOAD FUNCTION ====================
 
 function download_with_aria2() {
     local url="$1"
@@ -244,6 +252,7 @@ function download_with_hf_cli() {
     local output_dir="$2"
     local output_file="$3"
     
+    # Extract HF repo and file path
     if [[ "$url" =~ huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.+) ]]; then
         local repo_id="${BASH_REMATCH[1]}"
         local revision="${BASH_REMATCH[2]}"
@@ -251,6 +260,7 @@ function download_with_hf_cli() {
         
         log_info "Using HF CLI for: ${repo_id}/${filename}"
         
+        # HF CLI with hf_transfer (Rust-based, super fast)
         HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
             "$repo_id" \
             "$filename" \
@@ -261,11 +271,15 @@ function download_with_hf_cli() {
         
         local exit_code=${PIPESTATUS[0]}
         
+        # HF CLI downloads to original path structure
         local downloaded_file="${output_dir}/${filename}"
         
         if [[ $exit_code -eq 0 && -f "$downloaded_file" ]]; then
+            # Move to flat structure if needed
             if [[ "$downloaded_file" != "${output_dir}/${output_file}" ]]; then
                 mv "$downloaded_file" "${output_dir}/${output_file}" 2>/dev/null || true
+                
+                # Clean up empty directories
                 find "$output_dir" -type d -empty -delete 2>/dev/null || true
             fi
             return 0
@@ -277,7 +291,7 @@ function download_with_hf_cli() {
     return 1
 }
 
-# ==================== MASTER DOWNLOAD FUNCTION ====================
+# ==================== MASTER DOWNLOAD FUNCTION WITH RETRY ====================
 
 function provisioning_download_with_retry() {
     local url="$1"
@@ -289,13 +303,16 @@ function provisioning_download_with_retry() {
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "Target: ${filename}"
     
+    # Check if already exists and valid
     if [[ -f "$filepath" ]] && verify_file_integrity "$filepath"; then
         log_info "✓ Already exists: ${filename}"
         return 0
     fi
     
+    # Clean up any existing corrupted versions
     rm -f "$filepath" "$temp_filepath" "${filepath}.aria2"
     
+    # Determine auth token
     local auth_token=""
     if [[ -n "$HF_TOKEN" && "$url" =~ huggingface\.co ]]; then
         auth_token="$HF_TOKEN"
@@ -303,6 +320,7 @@ function provisioning_download_with_retry() {
         auth_token="$CIVITAI_TOKEN"
     fi
     
+    # Measure network speed (cached after first measurement)
     if [[ ! -f /tmp/network_speed_cached ]]; then
         local network_speed=$(measure_download_speed)
         echo "$network_speed" > /tmp/network_speed_cached
@@ -311,10 +329,12 @@ function provisioning_download_with_retry() {
         local network_speed=$(cat /tmp/network_speed_cached)
     fi
     
+    # Estimate file size and calculate intelligent timeout
     local estimated_size=$(estimate_file_size "$url")
     local intelligent_timeout=$(calculate_intelligent_timeout "$estimated_size" "$network_speed")
     log_info "Size: ~${estimated_size}GB | Timeout: ${intelligent_timeout}s"
     
+    # Retry loop with exponential backoff
     local attempt=1
     local retry_delay=$BASE_RETRY_DELAY
     
@@ -324,12 +344,14 @@ function provisioning_download_with_retry() {
         local download_start=$(date +%s)
         local success=false
         
+        # Try HF CLI first if HuggingFace URL
         if [[ "$url" =~ huggingface\.co ]]; then
             if download_with_hf_cli "$url" "$dir" "$filename"; then
                 success=true
             fi
         fi
         
+        # Fallback to aria2
         if [[ "$success" == "false" ]]; then
             log_info "Fallback: aria2c"
             if download_with_aria2 "$url" "$dir" "$filename" "$intelligent_timeout" "$auth_token"; then
@@ -340,17 +362,20 @@ function provisioning_download_with_retry() {
         local download_end=$(date +%s)
         local download_duration=$((download_end - download_start))
         
+        # Verify download
         if [[ "$success" == "true" ]] && verify_file_integrity "$filepath"; then
             local filesize=$(stat -c%s "$filepath" 2>/dev/null || stat -f%z "$filepath" 2>/dev/null)
             local size_mb=$((filesize / 1048576))
             
             log_info "✅ SUCCESS: ${filename} (${size_mb}MB in ${download_duration}s)"
             
+            # Clean up temp files
             rm -f "$temp_filepath" "${filepath}.aria2"
             
             return 0
         fi
         
+        # Download failed or corrupted
         log_warning "Attempt ${attempt} failed"
         rm -f "$filepath" "$temp_filepath" "${filepath}.aria2"
         
@@ -358,6 +383,7 @@ function provisioning_download_with_retry() {
             log_info "Retry in ${retry_delay}s..."
             sleep $retry_delay
             
+            # Exponential backoff with cap
             retry_delay=$((retry_delay * 2))
             if [[ $retry_delay -gt $MAX_RETRY_DELAY ]]; then
                 retry_delay=$MAX_RETRY_DELAY
@@ -404,47 +430,15 @@ EOF
 
 # ==================== PACKAGE DEFINITIONS ====================
 
-APT_PACKAGES=(
-    "ffmpeg"
-    # ffmpeg dev headers required so av==11.0.0 can build from source when no
-    # pre-built manylinux wheel matches this environment's Python/platform tags.
-    "libavformat-dev"
-    "libavcodec-dev"
-    "libavdevice-dev"
-    "libavutil-dev"
-    "libavfilter-dev"
-    "libswscale-dev"
-    "libswresample-dev"
-    "libsm6"
-    "libgl1"
-    "libglib2.0-0"
-    "pkg-config"
-)
+APT_PACKAGES=()
 
-# NOTE - protobuf: intentionally NOT pinned here.
-# The base vast.ai image ships protobuf 6.x. The Foley node's install.py detects
-# the descript-audio-codec conflict and skips gracefully with a warning — it does
-# NOT break provisioning. Pinning protobuf would risk downgrading it and breaking
-# transformers or other already-installed packages in the base image.
-#
-# NOTE - whisperx: intentionally NOT installed via pip.
-# AIFSH/ComfyUI-WhisperX bundles a local whisperx/ package inside the node repo.
-# Installing a separate pip whisperx on top creates a shadowing conflict where the
-# wrong copy is imported. The node's own requirements.txt (run by provisioning_get_nodes)
-# covers all runtime dependencies whisperx needs (faster-whisper, pyannote, etc.).
 PIP_PACKAGES=(
     "transformers==4.57.3"
-    "timm"
-    # openai-whisper is used by provisioning_setup_whisperx to pre-download model weights
-    "openai-whisper"
 )
 
 NODES=(
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/flybirdxx/ComfyUI-Qwen-TTS"
-    "https://github.com/AIFSH/ComfyUI-WhisperX"
-    "https://github.com/if-ai/ComfyUI_HunyuanVideoFoley"
-    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
 )
 
 CHECKPOINT_MODELS=()
@@ -476,145 +470,6 @@ CONTROLNET_MODELS=()
 LATENT_UPSCALE_MODELS=()
 WORKFLOWS=()
 
-# ==================== POST-INSTALL FOR SPECIAL NODES ====================
-
-function provisioning_post_install_foley() {
-    log_info "Running HunyuanVideoFoley post-install..."
-    
-    local foley_path="${COMFYUI_DIR}/custom_nodes/ComfyUI_HunyuanVideoFoley"
-    
-    if [[ -d "$foley_path" ]]; then
-        cd "$foley_path"
-        
-        log_info "Installing Foley dependencies..."
-
-        # STEP 1 - Install the node's own requirements.txt first.
-        if [[ -f "requirements.txt" ]]; then
-            pip install --no-cache-dir -r requirements.txt 2>&1 | tee -a "$PROVISION_LOG" \
-                || log_warning "Foley requirements.txt had issues (may be normal)"
-        fi
-
-        # STEP 2 - Pre-install a Python 3.12-compatible spacy BEFORE audiocraft.
-        #
-        # Problem: audiocraft 1.3.0 requires spacy>=3.6.1. When pip resolves this
-        # on Python 3.12 it may back-track to spacy 3.5.x, which requires
-        # thinc<8.2.0. thinc 8.1.x has no pre-built cp312 wheel so pip compiles
-        # it from source. The Cython-generated code references _PyCFrame->use_tracing
-        # which was removed in Python 3.12 → hard compile error, spacy never installs,
-        # audiocraft fails entirely.
-        #
-        # Fix: pre-install spacy>=3.7.4 which ships a cp312-cp312-manylinux wheel
-        # (no compilation). It pulls in thinc>=8.3.0,<8.4.0 which also has cp312
-        # wheels. Pip then sees spacy already satisfied and never touches old thinc.
-        log_info "Pre-installing Python 3.12-compatible spacy (prevents thinc build failure)..."
-        pip install --no-cache-dir "spacy>=3.7.4" 2>&1 | tee -a "$PROVISION_LOG" \
-            || log_warning "spacy pre-install had issues"
-
-        # STEP 3 - Install audiocraft.
-        # With spacy already satisfied at >=3.7.4, the resolver won't pull in
-        # old thinc. With ffmpeg dev headers in APT_PACKAGES, av==11.0.0 can
-        # build from source if the manylinux wheel is unavailable here.
-        log_info "Installing audiocraft..."
-        pip install --no-cache-dir audiocraft 2>&1 | tee -a "$PROVISION_LOG" \
-            || log_warning "audiocraft install had issues"
-
-        # STEP 4 - Run the node's install.py (creates dirs, validates deps).
-        if [[ -f "install.py" ]]; then
-            python install.py 2>&1 | tee -a "$PROVISION_LOG" \
-                || log_warning "Foley install.py had issues (may be normal)"
-        fi
-        
-        cd "$COMFYUI_DIR"
-        log_info "✓ HunyuanVideoFoley post-install complete"
-    else
-        log_warning "Foley path not found, skipping post-install"
-    fi
-}
-
-function provisioning_setup_whisperx() {
-    log_info "Setting up WhisperX models..."
-    
-    local whisperx_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-WhisperX"
-    
-    if [[ ! -d "$whisperx_path" ]]; then
-        log_warning "WhisperX path not found, skipping"
-        return
-    fi
-    
-    # Create cache directories
-    mkdir -p /workspace/.cache/huggingface
-    mkdir -p /workspace/.cache/whisper
-    mkdir -p /workspace/.cache/torch/hub/checkpoints
-    
-    # Set environment variables for cache
-    export HF_HOME="/workspace/.cache/huggingface"
-    export TRANSFORMERS_CACHE="/workspace/.cache/huggingface"
-    export TORCH_HOME="/workspace/.cache/torch"
-    
-    # Download Whisper models (large-v3)
-    log_info "Downloading Whisper large-v3..."
-    python3 << 'PYTHON_SCRIPT'
-import os
-import sys
-
-os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
-os.environ['TORCH_HOME'] = '/workspace/.cache/torch'
-
-try:
-    import whisper
-    print("Loading Whisper large-v3...")
-    model = whisper.load_model("large-v3", download_root="/workspace/.cache/whisper")
-    print("✓ Whisper large-v3 downloaded")
-except Exception as e:
-    print(f"✗ Whisper download failed: {e}")
-    sys.exit(0)  # Don't fail provisioning
-PYTHON_SCRIPT
-    
-    # Try to download pyannote models (will fail if not accepted, that's OK)
-    log_info "Attempting to download pyannote models (requires HF token with access)..."
-    python3 << 'PYTHON_SCRIPT'
-import os
-import sys
-
-hf_token = os.environ.get('HF_TOKEN', '')
-
-if not hf_token:
-    print("⚠ HF_TOKEN not set, skipping pyannote download")
-    print("  Models will auto-download on first use if token is set at runtime")
-    sys.exit(0)
-
-os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
-
-try:
-    from pyannote.audio import Model
-    
-    print("Downloading pyannote/segmentation-3.0...")
-    model = Model.from_pretrained(
-        "pyannote/segmentation-3.0",
-        token=hf_token
-    )
-    print("✓ Segmentation model downloaded")
-    
-    print("Downloading pyannote/speaker-diarization-3.1...")
-    from pyannote.audio import Pipeline
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token
-    )
-    print("✓ Diarization model downloaded")
-    
-except Exception as e:
-    print(f"⚠ Pyannote download failed: {e}")
-    print("  This is expected if you haven't accepted the license at:")
-    print("  - https://huggingface.co/pyannote/segmentation-3.0")
-    print("  - https://huggingface.co/pyannote/speaker-diarization-3.1")
-    print("  Models will auto-download on first use after accepting licenses")
-    sys.exit(0)  # Don't fail provisioning
-PYTHON_SCRIPT
-    
-    log_info "✓ WhisperX setup complete"
-}
-
 # ==================== MAIN PROVISIONING ====================
 
 function provisioning_start() {
@@ -624,12 +479,11 @@ function provisioning_start() {
     
     install_download_tools
     setup_output_http_server
-    provisioning_get_apt_packages   # ffmpeg runtime + dev headers installed first
-    provisioning_get_nodes          # clone nodes + install their requirements.txt
-    provisioning_post_install_foley # spacy>=3.7.4 → audiocraft → install.py
-    provisioning_get_pip_packages   # transformers, timm, openai-whisper
-    provisioning_setup_whisperx     # pre-download whisper large-v3 weights
+    provisioning_get_apt_packages
+    provisioning_get_nodes
+    provisioning_get_pip_packages
     
+    # Clean corrupted files before downloading
     cleanup_corrupted_files "${COMFYUI_DIR}/models"
     
     provisioning_get_files "${COMFYUI_DIR}/models/loras" "${LORA_MODELS[@]}"
@@ -652,7 +506,7 @@ function provisioning_get_apt_packages() {
 function provisioning_get_pip_packages() {
     if [[ ${#PIP_PACKAGES[@]} -gt 0 ]]; then
         log_info "Installing PIP packages..."
-        pip install --no-cache-dir ${PIP_PACKAGES[@]} 2>&1 | tee -a "$PROVISION_LOG"
+        pip install --no-cache-dir ${PIP_PACKAGES[@]} > /dev/null 2>&1
     fi
 }
 
@@ -668,7 +522,7 @@ function provisioning_get_nodes() {
             git clone "${repo}" "${path}" --recursive --quiet 2>&1 | tee -a "$PROVISION_LOG"
             
             if [[ -f "${path}/requirements.txt" ]]; then
-                pip install --no-cache-dir -r "${path}/requirements.txt" 2>&1 | tee -a "$PROVISION_LOG"
+                pip install --no-cache-dir -r "${path}/requirements.txt" > /dev/null 2>&1
             fi
         fi
     done
