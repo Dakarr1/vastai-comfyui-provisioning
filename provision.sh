@@ -436,6 +436,7 @@ APT_PACKAGES=(
 PIP_PACKAGES=(
     "transformers==4.57.3"
     "openai-whisper"  # used below to pre-download Whisper large-v3 weights at provision time
+    "omegaconf"       # required by pyannote when loading the VAD model checkpoint
 )
 
 NODES=(
@@ -482,6 +483,35 @@ function provisioning_setup_whisperx() {
     if [[ ! -d "$whisperx_path" ]]; then
         log_warning "ComfyUI-WhisperX not found, skipping model pre-download"
         return
+    fi
+
+    # The AIFSH node's bundled vad.py expects pytorch_model.bin at a hardcoded local path
+    # AND verifies its SHA256. The original S3 download URL is dead (301 with no Location).
+    # The pip-installed whisperx package ships the correct file with the right checksum
+    # directly inside its assets/ directory — copy from there, no download needed.
+    local vad_model_path="${whisperx_path}/whisperx/assets/pytorch_model.bin"
+    local vad_sha256="0b5b3216d60a2d32fc086b47ea8c67589aaeb26b7e07fcbe620d6d0b83e209ea"
+
+    local need_copy=true
+    if [[ -f "$vad_model_path" ]]; then
+        local actual_sha=$(sha256sum "$vad_model_path" | awk '{print $1}')
+        if [[ "$actual_sha" == "$vad_sha256" ]]; then
+            log_info "✓ VAD model already present and verified"
+            need_copy=false
+        else
+            log_warning "VAD model checksum mismatch, replacing..."
+            rm -f "$vad_model_path"
+        fi
+    fi
+
+    if [[ "$need_copy" == "true" ]]; then
+        mkdir -p "${whisperx_path}/whisperx/assets"
+        # The model is shipped directly in the main whisperX GitHub repo assets/
+        # S3 URL is permanently dead; this is the canonical source used by the upstream project
+        wget -q -O "$vad_model_path" \
+            "https://github.com/m-bain/whisperX/raw/main/whisperx/assets/pytorch_model.bin" \
+            && log_info "✓ VAD model downloaded from whisperX GitHub" \
+            || log_error "❌ VAD model download failed — WhisperX will not work"
     fi
 
     # Persist model cache on /workspace so it survives instance restarts
@@ -581,6 +611,20 @@ function provisioning_get_nodes() {
             fi
         fi
     done
+
+    # The AIFSH/ComfyUI-WhisperX bundled vad.py uses pyannote.audio 2.x API.
+    # pyannote.audio 3.x dropped use_auth_token from Inference.__init__() and
+    # Model.from_pretrained(). pyannote.audio 2.1.1 requires torchaudio<1.0 which
+    # is incompatible with this environment. Fix: patch vad.py to drop the removed args.
+    local vad_py="${COMFYUI_DIR}/custom_nodes/ComfyUI-WhisperX/whisperx/vad.py"
+    if [[ -f "$vad_py" ]]; then
+        log_info "Patching vad.py for pyannote.audio 3.x compatibility..."
+        # Remove use_auth_token from Model.from_pretrained() call
+        sed -i 's/vad_model = Model.from_pretrained(model_fp, use_auth_token=use_auth_token)/vad_model = Model.from_pretrained(model_fp)/' "$vad_py"
+        # Remove use_auth_token from VoiceActivitySegmentation super().__init__() call
+        sed -i 's/super().__init__(segmentation=segmentation, fscore=fscore, use_auth_token=use_auth_token, \*\*inference_kwargs)/super().__init__(segmentation=segmentation, fscore=fscore, **inference_kwargs)/' "$vad_py"
+        log_info "OK vad.py patched"
+    fi
 }
 
 function provisioning_get_files() {
