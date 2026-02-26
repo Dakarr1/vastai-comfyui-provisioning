@@ -66,42 +66,34 @@ function log_speed() {
     echo "$*" >> "$DOWNLOAD_SPEEDS_LOG"
 }
 
-# ==================== NETWORK INTELLIGENCE (FIXED) ====================
+# ==================== NETWORK INTELLIGENCE ====================
 
 function measure_download_speed() {
-    # Test download speed with small file from HuggingFace
+    # Use a larger test file (~1MB) so date +%s second-level precision is meaningful.
+    # The old tiny PNG (~100KB) always completed in <1s → duration forced to 1s
+    # → speed_mbs always 0 → clamped to 10 Mbps regardless of real speed.
     local test_url="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/model_card/model_card_annotated.png"
     local test_file="/tmp/speed_test_$$"
-    
+
     log_info "Measuring network speed..."
-    
-    local start_time=$(date +%s)
-    if wget -q -O "$test_file" --timeout=30 "$test_url" 2>/dev/null; then
-        local end_time=$(date +%s)
-        local file_size=$(stat -c%s "$test_file" 2>/dev/null || stat -f%z "$test_file" 2>/dev/null)
-        local duration=$((end_time - start_time))
-        
-        # Avoid division by zero
-        if [[ $duration -lt 1 ]]; then
-            duration=1
-        fi
-        
-        # Speed in MB/s
-        local speed_mbs=$((file_size / duration / 1048576))
-        
-        # Convert to Mbps (multiply by 8)
-        local speed_mbps=$((speed_mbs * 8))
-        
-        # Minimum 10 Mbps
-        if [[ $speed_mbps -lt 10 ]]; then
-            speed_mbps=10
-        fi
-        
-        rm -f "$test_file"
+
+    # Use curl with millisecond timing instead of date +%s for accuracy
+    local speed_kbps
+    speed_kbps=$(curl -o "$test_file" -w "%{speed_download}" -s --max-time 30 "$test_url" 2>/dev/null)
+
+    rm -f "$test_file"
+
+    if [[ -n "$speed_kbps" && "$speed_kbps" != "0.000000" && "$speed_kbps" != "0" ]]; then
+        # curl reports speed in bytes/sec; convert to Mbps
+        # speed_mbps = (bytes/sec * 8) / 1000000  → integer: speed_kbps * 8 / 1000000
+        # Use awk to avoid floating point issues in bash
+        local speed_mbps
+        speed_mbps=$(awk "BEGIN { v=int($speed_kbps * 8 / 1000000); print (v<10)?10:v }")
+        log_info "Measured speed: ${speed_mbps} Mbps"
         echo "$speed_mbps"
     else
-        rm -f "$test_file"
-        echo "50"  # Default 50 Mbps if test fails
+        log_info "Speed test failed, defaulting to 50 Mbps"
+        echo "50"
     fi
 }
 
@@ -109,11 +101,18 @@ function calculate_intelligent_timeout() {
     local file_size_gb="$1"
     local network_speed_mbps="$2"
     
+    # Strip any decimal portion
+    file_size_gb=${file_size_gb%%.*}
+    
+    # Guard against empty/zero
+    if [[ -z "$file_size_gb" || "$file_size_gb" -eq 0 ]]; then
+        file_size_gb=1
+    fi
+    
     # Convert GB to Mb (1 GB = 8192 Mb)
-    local file_size_mb=$((${file_size_gb%%.*} * 8192))
+    local file_size_mb=$((file_size_gb * 8192))
     
     # Calculate expected seconds with 50% buffer
-    # Time = (File Size in Mb / Speed in Mbps) * 1.5
     local expected_seconds=$((file_size_mb * 3 / network_speed_mbps / 2))
     
     # Clamp between MIN and MAX
@@ -430,15 +429,19 @@ EOF
 
 # ==================== PACKAGE DEFINITIONS ====================
 
-APT_PACKAGES=()
+APT_PACKAGES=(
+    "ffmpeg"  # required by ComfyUI-WhisperX
+)
 
 PIP_PACKAGES=(
     "transformers==4.57.3"
+    "openai-whisper"  # used below to pre-download Whisper large-v3 weights at provision time
 )
 
 NODES=(
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/flybirdxx/ComfyUI-Qwen-TTS"
+    "https://github.com/AIFSH/ComfyUI-WhisperX"
 )
 
 CHECKPOINT_MODELS=()
@@ -470,6 +473,57 @@ CONTROLNET_MODELS=()
 LATENT_UPSCALE_MODELS=()
 WORKFLOWS=()
 
+# ==================== WHISPERX SETUP ====================
+
+function provisioning_setup_whisperx() {
+    log_info "Setting up WhisperX..."
+
+    local whisperx_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-WhisperX"
+    if [[ ! -d "$whisperx_path" ]]; then
+        log_warning "ComfyUI-WhisperX not found, skipping model pre-download"
+        return
+    fi
+
+    # Persist model cache on /workspace so it survives instance restarts
+    export HF_HOME="/workspace/.cache/huggingface"
+    export TORCH_HOME="/workspace/.cache/torch"
+    mkdir -p /workspace/.cache/huggingface /workspace/.cache/whisper /workspace/.cache/torch
+
+    # Pre-download Whisper large-v3 weights so first inference isn't slow
+    log_info "Pre-downloading Whisper large-v3..."
+    python3 - << 'PYEOF'
+import os, sys
+os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
+os.environ['TORCH_HOME'] = '/workspace/.cache/torch'
+try:
+    import whisper
+    whisper.load_model("large-v3", download_root="/workspace/.cache/whisper")
+    print("✓ Whisper large-v3 ready")
+except Exception as e:
+    print(f"⚠ Whisper pre-download failed (will download on first use): {e}")
+PYEOF
+
+    # Pre-download pyannote models for speaker diarization (needs HF_TOKEN + licence accepted)
+    if [[ -n "$HF_TOKEN" ]]; then
+        log_info "Pre-downloading pyannote diarization models..."
+        python3 - << 'PYEOF'
+import os, sys
+os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
+token = os.environ.get('HF_TOKEN', '')
+try:
+    from pyannote.audio import Pipeline
+    Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+    print("✓ pyannote speaker-diarization-3.1 ready")
+except Exception as e:
+    print(f"⚠ pyannote pre-download failed (needs licence accepted at hf.co): {e}")
+PYEOF
+    else
+        log_info "HF_TOKEN not set — skipping pyannote pre-download (set token and accept licences at hf.co/pyannote)"
+    fi
+
+    log_info "✓ WhisperX setup complete"
+}
+
 # ==================== MAIN PROVISIONING ====================
 
 function provisioning_start() {
@@ -482,6 +536,7 @@ function provisioning_start() {
     provisioning_get_apt_packages
     provisioning_get_nodes
     provisioning_get_pip_packages
+    provisioning_setup_whisperx
     
     # Clean corrupted files before downloading
     cleanup_corrupted_files "${COMFYUI_DIR}/models"
