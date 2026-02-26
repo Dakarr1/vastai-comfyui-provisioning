@@ -406,8 +406,8 @@ EOF
 
 APT_PACKAGES=(
     "ffmpeg"
-    # FIX 1: ffmpeg dev headers are required by the `av` package (pulled in by audiocraft).
-    # Without these, `av` cannot build from source and audiocraft installation fails entirely.
+    # ffmpeg dev headers required so av==11.0.0 can build from source when no
+    # pre-built manylinux wheel matches this environment's Python/platform tags.
     "libavformat-dev"
     "libavcodec-dev"
     "libavdevice-dev"
@@ -421,19 +421,22 @@ APT_PACKAGES=(
     "pkg-config"
 )
 
-# FIX 2: protobuf constraint tightened from <5.0.0 to <3.20.
+# NOTE - protobuf: intentionally NOT pinned here.
+# The base vast.ai image ships protobuf 6.x. The Foley node's install.py detects
+# the descript-audio-codec conflict and skips gracefully with a warning — it does
+# NOT break provisioning. Pinning protobuf would risk downgrading it and breaking
+# transformers or other already-installed packages in the base image.
 #
-# audiocraft (installed by HunyuanVideoFoley) depends on descript-audio-codec
-# which requires protobuf<3.20. The old constraint (<5.0.0) caused pip to
-# install protobuf 4.x, which silently broke audiocraft at runtime.
-#
-# transformers, whisperx, and all other packages here work fine with 3.x.
+# NOTE - whisperx: intentionally NOT installed via pip.
+# AIFSH/ComfyUI-WhisperX bundles a local whisperx/ package inside the node repo.
+# Installing a separate pip whisperx on top creates a shadowing conflict where the
+# wrong copy is imported. The node's own requirements.txt (run by provisioning_get_nodes)
+# covers all runtime dependencies whisperx needs (faster-whisper, pyannote, etc.).
 PIP_PACKAGES=(
     "transformers==4.57.3"
-    "protobuf>=3.9.2,<3.20"
     "timm"
+    # openai-whisper is used by provisioning_setup_whisperx to pre-download model weights
     "openai-whisper"
-    "git+https://github.com/m-bain/whisperx.git@main"
 )
 
 NODES=(
@@ -484,16 +487,41 @@ function provisioning_post_install_foley() {
         cd "$foley_path"
         
         log_info "Installing Foley dependencies..."
-        # FIX 3: Install timm first (no conflicts), then audiocraft separately.
-        # audiocraft is installed BEFORE the main PIP_PACKAGES step so that its
-        # protobuf<3.20 constraint wins and is not later overwritten by our own
-        # protobuf pin. The ffmpeg dev packages (FIX 1) must already be installed
-        # via APT_PACKAGES for the `av` wheel build to succeed here.
-        pip install --no-cache-dir timm 2>&1 | tee -a "$PROVISION_LOG" || log_warning "timm pre-install had issues"
-        pip install --no-cache-dir audiocraft 2>&1 | tee -a "$PROVISION_LOG" || log_warning "audiocraft install had issues"
-        
+
+        # STEP 1 - Install the node's own requirements.txt first.
+        if [[ -f "requirements.txt" ]]; then
+            pip install --no-cache-dir -r requirements.txt 2>&1 | tee -a "$PROVISION_LOG" \
+                || log_warning "Foley requirements.txt had issues (may be normal)"
+        fi
+
+        # STEP 2 - Pre-install a Python 3.12-compatible spacy BEFORE audiocraft.
+        #
+        # Problem: audiocraft 1.3.0 requires spacy>=3.6.1. When pip resolves this
+        # on Python 3.12 it may back-track to spacy 3.5.x, which requires
+        # thinc<8.2.0. thinc 8.1.x has no pre-built cp312 wheel so pip compiles
+        # it from source. The Cython-generated code references _PyCFrame->use_tracing
+        # which was removed in Python 3.12 → hard compile error, spacy never installs,
+        # audiocraft fails entirely.
+        #
+        # Fix: pre-install spacy>=3.7.4 which ships a cp312-cp312-manylinux wheel
+        # (no compilation). It pulls in thinc>=8.3.0,<8.4.0 which also has cp312
+        # wheels. Pip then sees spacy already satisfied and never touches old thinc.
+        log_info "Pre-installing Python 3.12-compatible spacy (prevents thinc build failure)..."
+        pip install --no-cache-dir "spacy>=3.7.4" 2>&1 | tee -a "$PROVISION_LOG" \
+            || log_warning "spacy pre-install had issues"
+
+        # STEP 3 - Install audiocraft.
+        # With spacy already satisfied at >=3.7.4, the resolver won't pull in
+        # old thinc. With ffmpeg dev headers in APT_PACKAGES, av==11.0.0 can
+        # build from source if the manylinux wheel is unavailable here.
+        log_info "Installing audiocraft..."
+        pip install --no-cache-dir audiocraft 2>&1 | tee -a "$PROVISION_LOG" \
+            || log_warning "audiocraft install had issues"
+
+        # STEP 4 - Run the node's install.py (creates dirs, validates deps).
         if [[ -f "install.py" ]]; then
-            python install.py 2>&1 | tee -a "$PROVISION_LOG" || log_warning "Foley install.py had issues (may be normal)"
+            python install.py 2>&1 | tee -a "$PROVISION_LOG" \
+                || log_warning "Foley install.py had issues (may be normal)"
         fi
         
         cd "$COMFYUI_DIR"
@@ -596,11 +624,11 @@ function provisioning_start() {
     
     install_download_tools
     setup_output_http_server
-    provisioning_get_apt_packages   # ffmpeg + dev headers installed here first
-    provisioning_get_nodes
-    provisioning_post_install_foley # audiocraft (needs dev headers) installs here
-    provisioning_get_pip_packages   # protobuf<3.20 already satisfied; pip won't downgrade
-    provisioning_setup_whisperx
+    provisioning_get_apt_packages   # ffmpeg runtime + dev headers installed first
+    provisioning_get_nodes          # clone nodes + install their requirements.txt
+    provisioning_post_install_foley # spacy>=3.7.4 → audiocraft → install.py
+    provisioning_get_pip_packages   # transformers, timm, openai-whisper
+    provisioning_setup_whisperx     # pre-download whisper large-v3 weights
     
     cleanup_corrupted_files "${COMFYUI_DIR}/models"
     
