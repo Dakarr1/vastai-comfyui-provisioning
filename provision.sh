@@ -103,9 +103,21 @@ function calculate_intelligent_timeout() {
     local file_size_gb="$1"
     local network_speed_mbps="$2"
     
-    local file_size_mb=$((${file_size_gb%%.*} * 8192))
+    # Remove decimal if present
+    file_size_gb=${file_size_gb%%.*}
+    
+    # Default to 1 if 0 or empty
+    if [[ -z "$file_size_gb" || "$file_size_gb" -eq 0 ]]; then
+        file_size_gb=1
+    fi
+    
+    # Convert GB to Mb (1 GB = 8192 Mb)
+    local file_size_mb=$((file_size_gb * 8192))
+    
+    # Calculate expected seconds with 50% buffer
     local expected_seconds=$((file_size_mb * 3 / network_speed_mbps / 2))
     
+    # Clamp between MIN and MAX
     if [[ $expected_seconds -lt $MIN_TIMEOUT ]]; then
         echo "$MIN_TIMEOUT"
     elif [[ $expected_seconds -gt $MAX_TIMEOUT ]]; then
@@ -397,10 +409,15 @@ APT_PACKAGES=(
     "libsm6"
     "libgl1"
     "libglib2.0-0"
+    "pkg-config"
 )
 
 PIP_PACKAGES=(
     "transformers==4.57.3"
+    "protobuf<5.0.0"
+    "timm"
+    "openai-whisper"
+    "git+https://github.com/m-bain/whisperx.git@main"
 )
 
 NODES=(
@@ -450,8 +467,12 @@ function provisioning_post_install_foley() {
     if [[ -d "$foley_path" ]]; then
         cd "$foley_path"
         
+        # Pre-install critical dependencies
+        log_info "Installing Foley dependencies..."
+        pip install --no-cache-dir timm audiocraft 2>&1 | tee -a "$PROVISION_LOG" || log_warning "Pre-install had issues"
+        
         if [[ -f "install.py" ]]; then
-            python install.py 2>&1 | tee -a "$PROVISION_LOG" || log_warning "Foley install.py had issues"
+            python install.py 2>&1 | tee -a "$PROVISION_LOG" || log_warning "Foley install.py had issues (may be normal)"
         fi
         
         cd "$COMFYUI_DIR"
@@ -459,6 +480,90 @@ function provisioning_post_install_foley() {
     else
         log_warning "Foley path not found, skipping post-install"
     fi
+}
+
+function provisioning_setup_whisperx() {
+    log_info "Setting up WhisperX models..."
+    
+    local whisperx_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-WhisperX"
+    
+    if [[ ! -d "$whisperx_path" ]]; then
+        log_warning "WhisperX path not found, skipping"
+        return
+    fi
+    
+    # Create cache directories
+    mkdir -p /workspace/.cache/huggingface
+    mkdir -p /workspace/.cache/whisper
+    mkdir -p /workspace/.cache/torch/hub/checkpoints
+    
+    # Set environment variables for cache
+    export HF_HOME="/workspace/.cache/huggingface"
+    export TRANSFORMERS_CACHE="/workspace/.cache/huggingface"
+    export TORCH_HOME="/workspace/.cache/torch"
+    
+    # Download Whisper models (large-v3)
+    log_info "Downloading Whisper large-v3..."
+    python3 << 'PYTHON_SCRIPT'
+import os
+import sys
+
+os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
+os.environ['TORCH_HOME'] = '/workspace/.cache/torch'
+
+try:
+    import whisper
+    print("Loading Whisper large-v3...")
+    model = whisper.load_model("large-v3", download_root="/workspace/.cache/whisper")
+    print("✓ Whisper large-v3 downloaded")
+except Exception as e:
+    print(f"✗ Whisper download failed: {e}")
+    sys.exit(0)  # Don't fail provisioning
+PYTHON_SCRIPT
+    
+    # Try to download pyannote models (will fail if not accepted, that's OK)
+    log_info "Attempting to download pyannote models (requires HF token with access)..."
+    python3 << 'PYTHON_SCRIPT'
+import os
+import sys
+
+hf_token = os.environ.get('HF_TOKEN', '')
+
+if not hf_token:
+    print("⚠ HF_TOKEN not set, skipping pyannote download")
+    print("  Models will auto-download on first use if token is set at runtime")
+    sys.exit(0)
+
+os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
+
+try:
+    from pyannote.audio import Model
+    
+    print("Downloading pyannote/segmentation-3.0...")
+    model = Model.from_pretrained(
+        "pyannote/segmentation-3.0",
+        token=hf_token
+    )
+    print("✓ Segmentation model downloaded")
+    
+    print("Downloading pyannote/speaker-diarization-3.1...")
+    from pyannote.audio import Pipeline
+    pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        use_auth_token=hf_token
+    )
+    print("✓ Diarization model downloaded")
+    
+except Exception as e:
+    print(f"⚠ Pyannote download failed: {e}")
+    print("  This is expected if you haven't accepted the license at:")
+    print("  - https://huggingface.co/pyannote/segmentation-3.0")
+    print("  - https://huggingface.co/pyannote/speaker-diarization-3.1")
+    print("  Models will auto-download on first use after accepting licenses")
+    sys.exit(0)  # Don't fail provisioning
+PYTHON_SCRIPT
+    
+    log_info "✓ WhisperX setup complete"
 }
 
 # ==================== MAIN PROVISIONING ====================
@@ -474,6 +579,7 @@ function provisioning_start() {
     provisioning_get_nodes
     provisioning_post_install_foley
     provisioning_get_pip_packages
+    provisioning_setup_whisperx
     
     cleanup_corrupted_files "${COMFYUI_DIR}/models"
     
@@ -497,7 +603,7 @@ function provisioning_get_apt_packages() {
 function provisioning_get_pip_packages() {
     if [[ ${#PIP_PACKAGES[@]} -gt 0 ]]; then
         log_info "Installing PIP packages..."
-        pip install --no-cache-dir ${PIP_PACKAGES[@]} > /dev/null 2>&1
+        pip install --no-cache-dir ${PIP_PACKAGES[@]} 2>&1 | tee -a "$PROVISION_LOG"
     fi
 }
 
@@ -513,7 +619,7 @@ function provisioning_get_nodes() {
             git clone "${repo}" "${path}" --recursive --quiet 2>&1 | tee -a "$PROVISION_LOG"
             
             if [[ -f "${path}/requirements.txt" ]]; then
-                pip install --no-cache-dir -r "${path}/requirements.txt" > /dev/null 2>&1
+                pip install --no-cache-dir -r "${path}/requirements.txt" 2>&1 | tee -a "$PROVISION_LOG"
             fi
         fi
     done
