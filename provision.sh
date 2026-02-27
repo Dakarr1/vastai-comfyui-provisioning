@@ -45,17 +45,17 @@ function install_download_tools() {
 # and corrupt the return value with timestamp strings.
 
 function measure_download_speed() {
-    # Strategy: download 100MB from Cloudflare speed test CDN with a 10s limit.
-    # curl -w "%{speed_download}" prints bytes/sec to stdout as a float.
-    # Using a large file + short timeout measures sustained throughput, not
-    # just TCP handshake time (which is what killed the tiny PNG approach).
-    # No log calls here — pure echo return value only.
-    local test_url="https://speed.cloudflare.com/__down?bytes=104857600"  # 100MB
+    # Downloads a real HuggingFace file for 15 seconds and reads curl's
+    # internal speed_download counter (bytes/sec as a float).
+    # We use a known ~170MB safetensors shard — HF is always reachable since
+    # we download models from there anyway. Cloudflare speed test CDN is
+    # often blocked on Vast.ai networks.
+    # NO log calls here — pure echo return value only.
+    local test_url="https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
 
     local raw
-    raw=$(curl -o /dev/null -w "%{speed_download}" -s --max-time 10 "$test_url" 2>/dev/null)
+    raw=$(curl -o /dev/null -w "%{speed_download}" -s --max-time 15 "$test_url" 2>/dev/null)
 
-    # raw is a float like "94371328.000" (bytes/sec). Convert to integer MB/s.
     local mbs
     mbs=$(python3 -c "
 try:
