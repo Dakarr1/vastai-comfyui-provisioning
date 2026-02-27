@@ -36,6 +36,10 @@ function install_download_tools() {
     pip install --no-cache-dir huggingface-hub[cli] hf_transfer 2>&1 | tee -a "$PROVISION_LOG"
     export HF_HUB_ENABLE_HF_TRANSFER=1
     log_info "✓ huggingface-cli installed"
+
+    log_info "Installing speedtest-cli..."
+    pip install --no-cache-dir speedtest-cli 2>&1 | tee -a "$PROVISION_LOG"
+    log_info "✓ speedtest-cli installed"
 }
 
 # ==================== NETWORK SPEED + AUTO-TERMINATE ====================
@@ -45,30 +49,13 @@ function install_download_tools() {
 # and corrupt the return value with timestamp strings.
 
 function measure_download_speed() {
-    # Downloads a real HuggingFace file for 15 seconds and reads curl's
-    # internal speed_download counter (bytes/sec as a float).
-    # We use a known ~170MB safetensors shard — HF is always reachable since
-    # we download models from there anyway. Cloudflare speed test CDN is
-    # often blocked on Vast.ai networks.
-    # NO log calls here — pure echo return value only.
-    local test_url="https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-
-    local raw
-    raw=$(curl -o /dev/null -w "%{speed_download}" -s --max-time 15 "$test_url" 2>/dev/null)
-
+    # --bytes makes speedtest-cli report in MB/s directly — no conversion needed.
+    # NO log calls — pure echo return value only.
     local mbs
-    mbs=$(python3 -c "
-try:
-    v = int(float('${raw}') / 1048576)
-    print(max(1, v))
-except:
-    print(1)
-" 2>/dev/null)
-
-    if ! [[ "$mbs" =~ ^[0-9]+$ ]]; then
-        mbs=1
+    mbs=$(python3 -m speedtest --simple --bytes 2>/dev/null | grep "Download:" | awk '{print $2}' | awk -F. '{print $1}')
+    if ! [[ "$mbs" =~ ^[0-9]+$ ]] || [[ "$mbs" -eq 0 ]]; then
+        mbs=999
     fi
-
     echo "$mbs"
 }
 
