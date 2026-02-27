@@ -14,7 +14,7 @@ MAX_TIMEOUT=1800
 PROVISION_LOG="/var/log/provisioning-detailed.log"
 
 # Auto-terminate if measured speed is below this threshold (MB/s).
-# Requires VASTAI_API_KEY set in your Vast.ai account Settings → Environment Variables.
+# Requires VASTAI_API_TOKEN set in your Vast.ai account Settings → Environment Variables.
 # $CONTAINER_ID is injected automatically by Vast.ai into every container.
 MIN_SPEED_MBS=50
 
@@ -76,7 +76,7 @@ function check_speed_and_maybe_terminate() {
         log_error "  Downloads will be extremely slow."
         log_error "══════════════════════════════════════════════"
 
-        if [[ -n "$VASTAI_API_KEY" ]]; then
+        if [[ -n "$VASTAI_API_TOKEN" ]]; then
             # $CONTAINER_ID is a Vast.ai built-in env var — always present, no API call needed.
             if [[ -z "$CONTAINER_ID" ]]; then
                 log_error "CONTAINER_ID not set — cannot auto-terminate"
@@ -87,7 +87,7 @@ function check_speed_and_maybe_terminate() {
             response=$(curl -s -o /dev/null -w "%{http_code}" \
                 -X DELETE \
                 "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/" \
-                -H "Authorization: Bearer ${VASTAI_API_KEY}")
+                -H "Authorization: Bearer ${VASTAI_API_TOKEN}")
             if [[ "$response" == "200" ]]; then
                 log_info "✓ Termination request accepted (HTTP 200). Halting provisioning."
             else
@@ -97,7 +97,7 @@ function check_speed_and_maybe_terminate() {
             sleep 30
             exit 1
         else
-            log_warning "VASTAI_API_KEY not set — skipping auto-terminate."
+            log_warning "VASTAI_API_TOKEN not set — skipping auto-terminate."
             log_warning "Set it in Vast.ai account Settings → Environment Variables."
         fi
     else
@@ -267,14 +267,7 @@ function provisioning_download_with_retry() {
     [[ -n "$HF_TOKEN"      && "$url" =~ huggingface\.co ]] && auth_token="$HF_TOKEN"
     [[ -n "$CIVITAI_TOKEN" && "$url" =~ civitai\.com    ]] && auth_token="$CIVITAI_TOKEN"
 
-    # Speed cached on first call (measure_download_speed has no log calls — safe to capture)
-    if [[ ! -f /tmp/_provision_speed ]]; then
-        log_info "Measuring network speed..."
-        local spd; spd=$(measure_download_speed)
-        echo "$spd" > /tmp/_provision_speed
-        check_speed_and_maybe_terminate "$spd"
-    fi
-    local speed_mbs; speed_mbs=$(cat /tmp/_provision_speed)
+    local speed_mbs; speed_mbs=$(cat /tmp/_provision_speed 2>/dev/null || echo 50)
 
     log_info "Estimating file size..."
     local gb; gb=$(estimate_file_size_gb "$url")
@@ -471,6 +464,17 @@ function provisioning_start() {
     log_info "=========================================="
 
     install_download_tools
+
+    # ── Speed check: must happen BEFORE any heavy work ──────────────────
+    # measure_download_speed() has NO log calls (pure echo return value).
+    # Logging only happens inside check_speed_and_maybe_terminate().
+    log_info "Measuring network speed..."
+    local NET_SPEED_MBS
+    NET_SPEED_MBS=$(measure_download_speed)
+    echo "$NET_SPEED_MBS" > /tmp/_provision_speed
+    check_speed_and_maybe_terminate "$NET_SPEED_MBS"
+    # ─────────────────────────────────────────────────────────────────────
+
     setup_output_http_server
     provisioning_get_apt_packages
     provisioning_get_nodes
