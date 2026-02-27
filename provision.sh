@@ -434,47 +434,47 @@ EOF
 
 # ==================== TUNNEL DISCOVERY + LABEL ====================
 
-function start_tunnel_for_port() {
-    # Starts cloudflared quick tunnel, returns the URL. NO log calls.
-    local port="$1"
-    local tmplog="/tmp/cloudflared_${port}.log"
-
-    cloudflared tunnel --url "http://localhost:${port}" \
-        --no-autoupdate 2>"$tmplog" &
-    echo $! > "/tmp/cloudflared_${port}.pid"
-
-    local waited=0
-    while [[ $waited -lt 60 ]]; do
-        local url
-        url=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$tmplog" 2>/dev/null | tail -1)
-        if [[ -n "$url" ]]; then
-            echo "$url"
-            return 0
-        fi
-        sleep 2
-        (( waited += 2 ))
-    done
-    echo ""
-}
-
 function setup_tunnels_and_label() {
-    log_info "Discovering all tunnel URLs from tunnel_manager.log..."
+    # The correct way to add a tunnel on Vast.ai:
+    # 1. Add the port to /etc/portal.yaml
+    # 2. supervisorctl reload — tunnel_manager creates the tunnel automatically
+    # 3. Wait for the URL to appear in tunnel_manager.log
+    # Never spawn cloudflared directly — tunnel_manager owns it exclusively.
 
     local logfile="/var/log/tunnel_manager.log"
-    local tunnels=""
+    local portal_yaml="/etc/portal.yaml"
 
-    # Wait up to 30s for tunnel_manager to write its URLs
+    # Add port 8081 to portal config if not already present
+    if [[ -f "$portal_yaml" ]]; then
+        if ! grep -q "8081" "$portal_yaml"; then
+            log_info "Adding port 8081 to /etc/portal.yaml..."
+            # Append to the services list — format: host:ext_port:int_port:path:name
+            # ext_port == int_port means no Caddy proxy, but tunnel is still created
+            echo "  - localhost:8081:8081:/:HTTP Output Server" >> "$portal_yaml"
+            supervisorctl reload 2>&1 | tee -a "$PROVISION_LOG"
+            log_info "✓ portal.yaml updated and supervisor reloaded"
+        else
+            log_info "Port 8081 already in portal.yaml"
+        fi
+    else
+        log_warning "/etc/portal.yaml not found — cannot register tunnel for 8081"
+    fi
+
+    # Wait for tunnel_manager to establish all tunnels (up to 60s)
+    log_info "Waiting for tunnel_manager to establish tunnels..."
     local waited=0
-    while [[ $waited -lt 30 ]]; do
+    while [[ $waited -lt 60 ]]; do
         if grep -q "trycloudflare.com" "$logfile" 2>/dev/null; then
             break
         fi
-        sleep 2
-        (( waited += 2 ))
+        sleep 3
+        (( waited += 3 ))
     done
 
+    local tunnels=""
+
     # Extract ALL port:url pairs from tunnel_manager.log
-    # Each line looks like: [http://localhost:PORT] ... https://xxx.trycloudflare.com
+    # Each relevant line: [http://localhost:PORT] ... https://xxx.trycloudflare.com
     while IFS= read -r line; do
         local port url
         port=$(echo "$line" | grep -oP '(?<=localhost:)\d+' | head -1)
@@ -482,30 +482,39 @@ function setup_tunnels_and_label() {
         if [[ -n "$port" && -n "$url" ]]; then
             [[ -n "$tunnels" ]] && tunnels="${tunnels},"
             tunnels="${tunnels}${port}:${url}"
-            log_info "✓ Found tunnel: ${port} → ${url}"
+            log_info "✓ Tunnel: ${port} → ${url}"
         fi
-    done < <(grep -P 'localhost:\d+' "$logfile" 2>/dev/null \
-             | grep 'trycloudflare\.com' | sort -u)
+    done < <(grep 'trycloudflare\.com' "$logfile" 2>/dev/null              | grep -oP 'localhost:\d+' | sort -u | while read -r portpart; do
+                 local_port="${portpart#localhost:}"
+                 url=$(grep "localhost:${local_port}" "$logfile"                        | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
+                 [[ -n "$url" ]] && echo "${local_port}__${url}"
+             done)
 
-    # Start cloudflared tunnel for our 8081 HTTP server
-    log_info "Starting cloudflared tunnel for port 8081..."
-    local http_url
-    http_url=$(start_tunnel_for_port 8081)
-    if [[ -n "$http_url" ]]; then
-        log_info "✓ HTTP server tunnel: 8081 → ${http_url}"
-        [[ -n "$tunnels" ]] && tunnels="${tunnels},"
-        tunnels="${tunnels}8081:${http_url}"
-    else
-        log_warning "Could not get tunnel URL for port 8081"
+    # Simpler fallback extraction if above yields nothing
+    if [[ -z "$tunnels" ]]; then
+        while IFS= read -r line; do
+            local port url
+            port=$(echo "$line" | grep -oP '(?<=localhost:)\d+' | head -1)
+            url=$(echo "$line"  | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)
+            if [[ -n "$port" && -n "$url" ]]; then
+                [[ -n "$tunnels" ]] && tunnels="${tunnels},"
+                tunnels="${tunnels}${port}:${url}"
+                log_info "✓ Tunnel: ${port} → ${url}"
+            fi
+        done < <(grep 'trycloudflare\.com' "$logfile" 2>/dev/null)
     fi
 
-    # Store tunnel part globally so set_status_label can always include it
     TUNNEL_LABEL_PART="$tunnels"
 
-    # Set initial status with all tunnels
-    set_status_label "Provisioning:started"
-    log_info "✓ Label set with all tunnels"
+    if [[ -n "$tunnels" ]]; then
+        set_status_label "Provisioning:started"
+        log_info "✓ Label set with all tunnels: ${tunnels}"
+    else
+        log_warning "No tunnel URLs found in tunnel_manager.log — label set without tunnels"
+        set_status_label "Provisioning:started"
+    fi
 }
+
 
 # ==================== PACKAGE DEFINITIONS ====================
 
