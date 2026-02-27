@@ -41,24 +41,32 @@ function install_download_tools() {
 # ==================== NETWORK SPEED + AUTO-TERMINATE ====================
 #
 # IMPORTANT: measure_download_speed() uses `echo` to return a value.
-# Never call log_info/log_warning inside it — those would be captured
-# by $() and corrupt the return value with timestamp strings.
+# NEVER call log_info/log_warning inside it — those get captured by $()
+# and corrupt the return value with timestamp strings.
 
 function measure_download_speed() {
-    # Downloads ~1MB test file. curl -w "%{speed_download}" writes bytes/sec
-    # to stdout (separate from the body via -o /dev/null).
-    # Returns a plain integer: MB/s (megabytes per second).
-    local test_url="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/model_card/model_card_annotated.png"
+    # Strategy: download 100MB from Cloudflare speed test CDN with a 10s limit.
+    # curl -w "%{speed_download}" prints bytes/sec to stdout as a float.
+    # Using a large file + short timeout measures sustained throughput, not
+    # just TCP handshake time (which is what killed the tiny PNG approach).
+    # No log calls here — pure echo return value only.
+    local test_url="https://speed.cloudflare.com/__down?bytes=104857600"  # 100MB
 
     local raw
-    raw=$(curl -o /dev/null -w "%{speed_download}" -s --max-time 30 "$test_url" 2>/dev/null)
+    raw=$(curl -o /dev/null -w "%{speed_download}" -s --max-time 10 "$test_url" 2>/dev/null)
 
     # raw is a float like "94371328.000" (bytes/sec). Convert to integer MB/s.
     local mbs
-    mbs=$(python3 -c "print(max(1, int(float('${raw}') / 1048576)))" 2>/dev/null)
+    mbs=$(python3 -c "
+try:
+    v = int(float('${raw}') / 1048576)
+    print(max(1, v))
+except:
+    print(1)
+" 2>/dev/null)
 
     if ! [[ "$mbs" =~ ^[0-9]+$ ]]; then
-        mbs=1   # measurement failed — use worst-case so timeout is generous
+        mbs=1
     fi
 
     echo "$mbs"
@@ -101,7 +109,9 @@ function check_speed_and_maybe_terminate() {
             log_warning "Set it in Vast.ai account Settings → Environment Variables."
         fi
     else
-        log_info "✓ Network speed OK"
+        log_info "══════════════════════════════════════════════"
+        log_info "  ✓ NETWORK SPEED OK: ${speed_mbs} MB/s"
+        log_info "══════════════════════════════════════════════"
     fi
 }
 
@@ -124,24 +134,84 @@ function calculate_timeout() {
     fi
 }
 
-function estimate_file_size_gb() {
-    # Returns integer GB from Content-Length header, or 5 as default.
+function estimate_file_size_bytes() {
+    # Returns exact file size in bytes using three methods in order:
+    # 1. HuggingFace metadata API (most accurate for HF URLs)
+    # 2. HTTP HEAD Content-Length
+    # 3. Fallback: 5GB
+    # NO log calls — this function is used inside $() captures.
     local url="$1"
-    local bytes
-    bytes=$(curl -sI --max-time 10 "$url" 2>/dev/null \
-        | grep -i "^content-length:" | awk '{print $2}' | tr -d '\r')
-    if [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 ]]; then
-        local gb=$(( bytes / 1073741824 ))
-        echo $(( gb < 1 ? 1 : gb ))
-    else
-        echo "5"
+    local bytes=0
+
+    if [[ "$url" =~ huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.+) ]]; then
+        local repo="${BASH_REMATCH[1]}"
+        local rev="${BASH_REMATCH[2]}"
+        local file="${BASH_REMATCH[3]}"
+        # HF metadata API returns JSON with "size" field in bytes
+        local api_url="https://huggingface.co/api/models/${repo}/tree/${rev}"
+        bytes=$(curl -s --max-time 10 "$api_url" 2>/dev/null             | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+fname = '${file}'
+for f in data:
+    if f.get('path') == fname:
+        print(f.get('size', 0))
+        sys.exit(0)
+print(0)
+" 2>/dev/null)
     fi
+
+    # Fallback to HEAD if API gave nothing
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]] || [[ "$bytes" -eq 0 ]]; then
+        bytes=$(curl -sI --max-time 10 "$url" 2>/dev/null             | grep -i "^content-length:" | awk '{print $2}' | tr -d '
+')
+    fi
+
+    if [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 ]]; then
+        echo "$bytes"
+    else
+        echo "5368709120"  # 5GB default
+    fi
+}
+
+function estimate_file_size_gb() {
+    local bytes
+    bytes=$(estimate_file_size_bytes "$1")
+    local gb=$(( bytes / 1073741824 ))
+    echo $(( gb < 1 ? 1 : gb ))
 }
 
 # ==================== INTEGRITY VERIFICATION ====================
 
+function get_hf_sha256() {
+    # Fetch expected SHA256 from HuggingFace API for a given URL.
+    # Returns the hash string or empty string if unavailable.
+    # NO log calls — used inside $() captures.
+    local url="$1"
+    if [[ "$url" =~ huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.+) ]]; then
+        local repo="${BASH_REMATCH[1]}"
+        local rev="${BASH_REMATCH[2]}"
+        local file="${BASH_REMATCH[3]}"
+        curl -s --max-time 10             "https://huggingface.co/api/models/${repo}/tree/${rev}" 2>/dev/null             | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    fname = '${file}'
+    for f in data:
+        if f.get('path') == fname:
+            lfs = f.get('lfs', {})
+            print(lfs.get('sha256', ''))
+            sys.exit(0)
+except: pass
+print('')
+" 2>/dev/null
+    fi
+}
+
 function verify_file_integrity() {
     local filepath="$1"
+    local expected_sha="$2"   # optional: pass expected SHA256 to verify against
+
     [[ ! -f "$filepath" ]] && return 1
 
     local filesize
@@ -152,11 +222,28 @@ function verify_file_integrity() {
         return 1
     fi
 
+    # If expected SHA256 provided, verify it
+    if [[ -n "$expected_sha" ]]; then
+        log_info "Verifying SHA256: $(basename "$filepath")..."
+        local actual_sha
+        actual_sha=$(sha256sum "$filepath" | awk '{print $1}')
+        if [[ "$actual_sha" == "$expected_sha" ]]; then
+            log_info "✓ SHA256 match: $(basename "$filepath") ($(( filesize / 1048576 ))MB)"
+            return 0
+        else
+            log_error "✗ SHA256 MISMATCH: $(basename "$filepath")"
+            log_error "  Expected: ${expected_sha}"
+            log_error "  Actual:   ${actual_sha}"
+            return 1
+        fi
+    fi
+
+    # No SHA256 provided — fall back to safetensors header check
     case "$filepath" in
         *.safetensors)
             local ok
             ok=$(python3 -c "
-import struct, sys
+import struct
 try:
     with open('$filepath','rb') as f:
         n = struct.unpack('<Q', f.read(8))[0]
@@ -257,7 +344,19 @@ function provisioning_download_with_retry() {
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "File: ${filename}"
 
-    if [[ -f "$filepath" ]] && verify_file_integrity "$filepath"; then
+    # Fetch expected SHA256 from HF API before doing anything else
+    local expected_sha=""
+    if [[ "$url" =~ huggingface\.co ]]; then
+        log_info "Fetching SHA256 from HF API..."
+        expected_sha=$(get_hf_sha256 "$url")
+        if [[ -n "$expected_sha" ]]; then
+            log_info "Expected SHA256: ${expected_sha}"
+        else
+            log_warning "SHA256 unavailable from HF API — will use header check only"
+        fi
+    fi
+
+    if [[ -f "$filepath" ]] && verify_file_integrity "$filepath" "$expected_sha"; then
         log_info "✓ Already valid — skipping"
         return 0
     fi
@@ -269,10 +368,13 @@ function provisioning_download_with_retry() {
 
     local speed_mbs; speed_mbs=$(cat /tmp/_provision_speed 2>/dev/null || echo 50)
 
-    log_info "Estimating file size..."
-    local gb; gb=$(estimate_file_size_gb "$url")
+    log_info "Fetching exact file size from HF API..."
+    local file_bytes; file_bytes=$(estimate_file_size_bytes "$url")
+    local gb=$(( file_bytes / 1073741824 ))
+    [[ $gb -lt 1 ]] && gb=1
+    local size_mb=$(( file_bytes / 1048576 ))
     local timeout; timeout=$(calculate_timeout "$gb" "$speed_mbs")
-    log_info "Size: ~${gb}GB | Speed: ${speed_mbs} MB/s | Timeout: ${timeout}s"
+    log_info "Size: ${size_mb}MB (~${gb}GB) | Speed: ${speed_mbs} MB/s | Timeout: ${timeout}s"
 
     local attempt=1 retry_delay=$BASE_RETRY_DELAY
     while [[ $attempt -le $MAX_RETRIES ]]; do
@@ -290,7 +392,7 @@ function provisioning_download_with_retry() {
 
         local elapsed=$(( $(date +%s) - t0 ))
 
-        if [[ "$ok" == "true" ]] && verify_file_integrity "$filepath"; then
+        if [[ "$ok" == "true" ]] && verify_file_integrity "$filepath" "$expected_sha"; then
             local mb=$(( $(stat -c%s "$filepath" 2>/dev/null || echo 0) / 1048576 ))
             log_info "✅ ${filename} done (${mb}MB in ${elapsed}s)"
             rm -f "${filepath}.tmp" "${filepath}.aria2"
