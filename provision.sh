@@ -13,16 +13,45 @@ MAX_TIMEOUT=1800
 
 PROVISION_LOG="/var/log/provisioning-detailed.log"
 
-# Auto-terminate if measured speed is below this threshold (MB/s).
-# Requires VASTAI_API_TOKEN set in your Vast.ai account Settings → Environment Variables.
-# $CONTAINER_ID is injected automatically by Vast.ai into every container.
-MIN_SPEED_MBS=50
+# Auto-terminate if speed is below threshold (MB/s).
+# VASTAI_API_TOKEN must be set in Vast.ai account Settings → Environment Variables.
+# CONTAINER_ID is injected automatically by Vast.ai.
+MIN_SPEED_MBS=30
+
+# Global: tunnel portion of label — set once in setup_tunnels_and_label,
+# then preserved in every subsequent set_status_label call.
+TUNNEL_LABEL_PART=""
 
 # ==================== LOGGING ====================
 
 function log_info()    { echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $*"    | tee -a "$PROVISION_LOG"; }
 function log_error()   { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $*"   | tee -a "$PROVISION_LOG" >&2; }
 function log_warning() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $*" | tee -a "$PROVISION_LOG"; }
+
+# ==================== LABEL / STATUS ====================
+
+function set_instance_label() {
+    # Raw label setter — pass full label string.
+    # NO log calls inside — called from functions that may be used in $() captures.
+    local label="$1"
+    [[ -z "$VASTAI_API_TOKEN" || -z "$CONTAINER_ID" ]] && return 1
+    curl -s -o /dev/null \
+        -X PUT \
+        "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/" \
+        -H "Authorization: Bearer ${VASTAI_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"label\": \"${label}\"}" 2>/dev/null
+}
+
+function set_status_label() {
+    # Sets label as "status:MESSAGE|TUNNELS" preserving tunnel info.
+    # Use this everywhere to update provisioning status.
+    local status="$1"
+    local label="status:${status}"
+    [[ -n "$TUNNEL_LABEL_PART" ]] && label="${label}|${TUNNEL_LABEL_PART}"
+    set_instance_label "$label"
+    log_info "◈ Status: ${status}"
+}
 
 # ==================== INSTALL TOOLS ====================
 
@@ -32,68 +61,54 @@ function install_download_tools() {
     apt-get install -y aria2 curl jq bc 2>&1 | tee -a "$PROVISION_LOG"
     log_info "✓ aria2/curl/jq/bc installed"
 
-    log_info "Installing huggingface-hub + hf_transfer (pip)..."
-    pip install --no-cache-dir huggingface-hub[cli] hf_transfer 2>&1 | tee -a "$PROVISION_LOG"
+    log_info "Installing pip tools..."
+    pip install --no-cache-dir huggingface-hub[cli] hf_transfer speedtest-cli 2>&1 | tee -a "$PROVISION_LOG"
     export HF_HUB_ENABLE_HF_TRANSFER=1
-    log_info "✓ huggingface-cli installed"
-
-    log_info "Installing speedtest-cli..."
-    pip install --no-cache-dir speedtest-cli 2>&1 | tee -a "$PROVISION_LOG"
-    log_info "✓ speedtest-cli installed"
+    log_info "✓ pip tools installed"
 }
 
 # ==================== NETWORK SPEED + AUTO-TERMINATE ====================
-#
 # IMPORTANT: measure_download_speed() uses `echo` to return a value.
-# NEVER call log_info/log_warning inside it — those get captured by $()
-# and corrupt the return value with timestamp strings.
+# NEVER call log_info inside it — those get captured by $() and corrupt the result.
 
 function measure_download_speed() {
-    # --bytes makes speedtest-cli report in MB/s directly — no conversion needed.
-    # NO log calls — pure echo return value only.
+    # --bytes makes speedtest-cli report in MB/s directly.
+    # Returns plain integer MB/s. NO log calls.
     local mbs
-    mbs=$(python3 -m speedtest --simple --bytes 2>/dev/null | grep "Download:" | awk '{print $2}' | awk -F. '{print $1}')
+    mbs=$(python3 -m speedtest --simple --bytes 2>/dev/null \
+        | grep "Download:" | awk '{print $2}' | awk -F. '{print $1}')
     if ! [[ "$mbs" =~ ^[0-9]+$ ]] || [[ "$mbs" -eq 0 ]]; then
-        mbs=999
+        mbs=999  # measurement failed — never wrongly terminate
     fi
     echo "$mbs"
 }
 
 function check_speed_and_maybe_terminate() {
-    # NOTE: this function logs — call it AFTER capturing measure_download_speed().
     local speed_mbs="$1"
-
-    log_info "Network speed: ${speed_mbs} MB/s (threshold: ${MIN_SPEED_MBS} MB/s)"
 
     if [[ "$speed_mbs" -lt "$MIN_SPEED_MBS" ]]; then
         log_error "══════════════════════════════════════════════"
         log_error "  SLOW NETWORK: ${speed_mbs} MB/s < ${MIN_SPEED_MBS} MB/s"
         log_error "  Downloads will be extremely slow."
         log_error "══════════════════════════════════════════════"
+        set_status_label "TERMINATED:slow_network_${speed_mbs}MBs"
 
-        if [[ -n "$VASTAI_API_TOKEN" ]]; then
-            # $CONTAINER_ID is a Vast.ai built-in env var — always present, no API call needed.
-            if [[ -z "$CONTAINER_ID" ]]; then
-                log_error "CONTAINER_ID not set — cannot auto-terminate"
-                return
-            fi
-            log_warning "Auto-terminating instance ${CONTAINER_ID} due to slow network..."
+        if [[ -n "$VASTAI_API_TOKEN" && -n "$CONTAINER_ID" ]]; then
+            log_warning "Auto-terminating instance ${CONTAINER_ID}..."
             local response
             response=$(curl -s -o /dev/null -w "%{http_code}" \
                 -X DELETE \
                 "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/" \
                 -H "Authorization: Bearer ${VASTAI_API_TOKEN}")
             if [[ "$response" == "200" ]]; then
-                log_info "✓ Termination request accepted (HTTP 200). Halting provisioning."
+                log_info "✓ Termination accepted. Halting."
             else
-                log_error "Termination request returned HTTP ${response}"
+                log_error "Termination returned HTTP ${response}"
             fi
-            # Sleep so the delete has time to propagate before the process exits
             sleep 30
             exit 1
         else
-            log_warning "VASTAI_API_TOKEN not set — skipping auto-terminate."
-            log_warning "Set it in Vast.ai account Settings → Environment Variables."
+            log_warning "VASTAI_API_TOKEN or CONTAINER_ID not set — skipping auto-terminate."
         fi
     else
         log_info "══════════════════════════════════════════════"
@@ -103,83 +118,70 @@ function check_speed_and_maybe_terminate() {
 }
 
 function calculate_timeout() {
-    # Args: file_size_gb  speed_mbs
-    # Returns seconds, clamped between MIN_TIMEOUT and MAX_TIMEOUT.
-    local gb="$1"
-    local mbs="$2"
-
+    local gb="$1" mbs="$2"
     gb=${gb%%.*}
     [[ -z "$gb" || "$gb" -le 0 ]] && gb=1
     [[ "$mbs" -le 0 ]] && mbs=1
-
-    # seconds = (gb * 1024 MB) / speed_mbs * 1.5 safety buffer
     local secs=$(( gb * 1024 * 3 / mbs / 2 ))
-
     if   [[ $secs -lt $MIN_TIMEOUT ]]; then echo "$MIN_TIMEOUT"
     elif [[ $secs -gt $MAX_TIMEOUT ]]; then echo "$MAX_TIMEOUT"
     else echo "$secs"
     fi
 }
 
+# ==================== FILE SIZE + SHA256 ====================
+# NO log calls in these functions — used inside $() captures.
+
 function estimate_file_size_bytes() {
-    # Returns exact file size in bytes using three methods in order:
-    # 1. HuggingFace metadata API (most accurate for HF URLs)
-    # 2. HTTP HEAD Content-Length
-    # 3. Fallback: 5GB
-    # NO log calls — this function is used inside $() captures.
     local url="$1"
     local bytes=0
 
     if [[ "$url" =~ huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.+) ]]; then
-        local repo="${BASH_REMATCH[1]}"
-        local rev="${BASH_REMATCH[2]}"
-        local file="${BASH_REMATCH[3]}"
-        # HF metadata API returns JSON with "size" field in bytes
-        local api_url="https://huggingface.co/api/models/${repo}/tree/${rev}"
-        bytes=$(curl -s --max-time 10 "$api_url" 2>/dev/null             | python3 -c "
+        local repo="${BASH_REMATCH[1]}" rev="${BASH_REMATCH[2]}" file="${BASH_REMATCH[3]}"
+        bytes=$(curl -s --max-time 10 \
+            "https://huggingface.co/api/models/${repo}/tree/${rev}" 2>/dev/null \
+            | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
-fname = '${file}'
-for f in data:
-    if f.get('path') == fname:
-        print(f.get('size', 0))
-        sys.exit(0)
+try:
+    data = json.load(sys.stdin)
+    fname = '${file}'
+    for f in data:
+        if f.get('path') == fname:
+            print(f.get('size', 0))
+            sys.exit(0)
+except: pass
 print(0)
 " 2>/dev/null)
     fi
 
-    # Fallback to HEAD if API gave nothing
     if ! [[ "$bytes" =~ ^[0-9]+$ ]] || [[ "$bytes" -eq 0 ]]; then
-        bytes=$(curl -sI --max-time 10 "$url" 2>/dev/null             | grep -i "^content-length:" | awk '{print $2}' | tr -d '
-')
+        bytes=$(curl -sI --max-time 10 "$url" 2>/dev/null \
+            | grep -i "^content-length:" | awk '{print $2}' | tr -d '\r')
     fi
 
     if [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 ]]; then
         echo "$bytes"
     else
-        echo "5368709120"  # 5GB default
+        echo "5368709120"
     fi
 }
 
 function estimate_file_size_gb() {
-    local bytes
-    bytes=$(estimate_file_size_bytes "$1")
+    local bytes; bytes=$(estimate_file_size_bytes "$1")
     local gb=$(( bytes / 1073741824 ))
     echo $(( gb < 1 ? 1 : gb ))
 }
 
-# ==================== INTEGRITY VERIFICATION ====================
-
 function get_hf_sha256() {
-    # Fetch expected SHA256 from HuggingFace API for a given URL.
-    # Returns the hash string or empty string if unavailable.
-    # NO log calls — used inside $() captures.
+    # Returns the SHA256 hash (without prefix) for a HF file URL.
+    # HF API returns lfs.oid as "sha256:abcdef..." — strip the prefix.
+    # NO log calls.
     local url="$1"
     if [[ "$url" =~ huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.+) ]]; then
-        local repo="${BASH_REMATCH[1]}"
-        local rev="${BASH_REMATCH[2]}"
-        local file="${BASH_REMATCH[3]}"
-        curl -s --max-time 10             "https://huggingface.co/api/models/${repo}/tree/${rev}" 2>/dev/null             | python3 -c "
+        local repo="${BASH_REMATCH[1]}" rev="${BASH_REMATCH[2]}" file="${BASH_REMATCH[3]}"
+        curl -s --max-time 10 \
+            "https://huggingface.co/api/models/${repo}/tree/${rev}" 2>/dev/null \
+            | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -187,7 +189,9 @@ try:
     for f in data:
         if f.get('path') == fname:
             lfs = f.get('lfs', {})
-            print(lfs.get('sha256', ''))
+            oid = lfs.get('oid', lfs.get('sha256', ''))
+            # Strip 'sha256:' prefix if present
+            print(oid.replace('sha256:', ''))
             sys.exit(0)
 except: pass
 print('')
@@ -195,9 +199,11 @@ print('')
     fi
 }
 
+# ==================== INTEGRITY VERIFICATION ====================
+
 function verify_file_integrity() {
     local filepath="$1"
-    local expected_sha="$2"   # optional: pass expected SHA256 to verify against
+    local expected_sha="$2"
 
     [[ ! -f "$filepath" ]] && return 1
 
@@ -209,13 +215,12 @@ function verify_file_integrity() {
         return 1
     fi
 
-    # If expected SHA256 provided, verify it
     if [[ -n "$expected_sha" ]]; then
         log_info "Verifying SHA256: $(basename "$filepath")..."
         local actual_sha
         actual_sha=$(sha256sum "$filepath" | awk '{print $1}')
         if [[ "$actual_sha" == "$expected_sha" ]]; then
-            log_info "✓ SHA256 match: $(basename "$filepath") ($(( filesize / 1048576 ))MB)"
+            log_info "✓ SHA256 OK: $(basename "$filepath") ($(( filesize / 1048576 ))MB)"
             return 0
         else
             log_error "✗ SHA256 MISMATCH: $(basename "$filepath")"
@@ -225,7 +230,7 @@ function verify_file_integrity() {
         fi
     fi
 
-    # No SHA256 provided — fall back to safetensors header check
+    # No SHA256 — safetensors header check
     case "$filepath" in
         *.safetensors)
             local ok
@@ -304,7 +309,7 @@ function download_with_hf_cli() {
         local repo="${BASH_REMATCH[1]}" rev="${BASH_REMATCH[2]}" file="${BASH_REMATCH[3]}"
         log_info "HF CLI: ${repo}/${file}"
 
-        HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download \
+        HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
             "$repo" "$file" --revision "$rev" \
             --local-dir "$dir" --local-dir-use-symlinks False \
             --resume-download 2>&1 \
@@ -330,8 +335,9 @@ function provisioning_download_with_retry() {
 
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "File: ${filename}"
+    set_status_label "Downloading:${filename}"
 
-    # Fetch expected SHA256 from HF API before doing anything else
+    # Fetch SHA256 from HF API
     local expected_sha=""
     if [[ "$url" =~ huggingface\.co ]]; then
         log_info "Fetching SHA256 from HF API..."
@@ -339,7 +345,7 @@ function provisioning_download_with_retry() {
         if [[ -n "$expected_sha" ]]; then
             log_info "Expected SHA256: ${expected_sha}"
         else
-            log_warning "SHA256 unavailable from HF API — will use header check only"
+            log_warning "SHA256 not available — will use header check only"
         fi
     fi
 
@@ -355,7 +361,6 @@ function provisioning_download_with_retry() {
 
     local speed_mbs; speed_mbs=$(cat /tmp/_provision_speed 2>/dev/null || echo 50)
 
-    log_info "Fetching exact file size from HF API..."
     local file_bytes; file_bytes=$(estimate_file_size_bytes "$url")
     local gb=$(( file_bytes / 1073741824 ))
     [[ $gb -lt 1 ]] && gb=1
@@ -427,6 +432,81 @@ EOF
         || log_warning "HTTP server may not have started"
 }
 
+# ==================== TUNNEL DISCOVERY + LABEL ====================
+
+function start_tunnel_for_port() {
+    # Starts cloudflared quick tunnel, returns the URL. NO log calls.
+    local port="$1"
+    local tmplog="/tmp/cloudflared_${port}.log"
+
+    cloudflared tunnel --url "http://localhost:${port}" \
+        --no-autoupdate 2>"$tmplog" &
+    echo $! > "/tmp/cloudflared_${port}.pid"
+
+    local waited=0
+    while [[ $waited -lt 60 ]]; do
+        local url
+        url=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' "$tmplog" 2>/dev/null | tail -1)
+        if [[ -n "$url" ]]; then
+            echo "$url"
+            return 0
+        fi
+        sleep 2
+        (( waited += 2 ))
+    done
+    echo ""
+}
+
+function setup_tunnels_and_label() {
+    log_info "Discovering all tunnel URLs from tunnel_manager.log..."
+
+    local logfile="/var/log/tunnel_manager.log"
+    local tunnels=""
+
+    # Wait up to 30s for tunnel_manager to write its URLs
+    local waited=0
+    while [[ $waited -lt 30 ]]; do
+        if grep -q "trycloudflare.com" "$logfile" 2>/dev/null; then
+            break
+        fi
+        sleep 2
+        (( waited += 2 ))
+    done
+
+    # Extract ALL port:url pairs from tunnel_manager.log
+    # Each line looks like: [http://localhost:PORT] ... https://xxx.trycloudflare.com
+    while IFS= read -r line; do
+        local port url
+        port=$(echo "$line" | grep -oP '(?<=localhost:)\d+' | head -1)
+        url=$(echo "$line"  | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)
+        if [[ -n "$port" && -n "$url" ]]; then
+            [[ -n "$tunnels" ]] && tunnels="${tunnels},"
+            tunnels="${tunnels}${port}:${url}"
+            log_info "✓ Found tunnel: ${port} → ${url}"
+        fi
+    done < <(grep -P 'localhost:\d+' "$logfile" 2>/dev/null \
+             | grep 'trycloudflare\.com' | sort -u)
+
+    # Start cloudflared tunnel for our 8081 HTTP server
+    log_info "Starting cloudflared tunnel for port 8081..."
+    local http_url
+    http_url=$(start_tunnel_for_port 8081)
+    if [[ -n "$http_url" ]]; then
+        log_info "✓ HTTP server tunnel: 8081 → ${http_url}"
+        [[ -n "$tunnels" ]] && tunnels="${tunnels},"
+        tunnels="${tunnels}8081:${http_url}"
+    else
+        log_warning "Could not get tunnel URL for port 8081"
+    fi
+
+    # Store tunnel part globally so set_status_label can always include it
+    TUNNEL_LABEL_PART="$tunnels"
+
+    # Set initial status with all tunnels
+    set_status_label "Provisioning:started"
+    log_info "✓ Label set with all tunnels"
+}
+
 # ==================== PACKAGE DEFINITIONS ====================
 
 APT_PACKAGES=(
@@ -478,6 +558,7 @@ WORKFLOWS=()
 
 function provisioning_setup_whisperx() {
     log_info "Setting up WhisperX..."
+    set_status_label "Provisioning:whisperx_setup"
 
     local wx="${COMFYUI_DIR}/custom_nodes/ComfyUI-WhisperX"
     [[ ! -d "$wx" ]] && { log_warning "ComfyUI-WhisperX not found, skipping"; return; }
@@ -499,6 +580,7 @@ function provisioning_setup_whisperx() {
 
     if [[ "$need_dl" == "true" ]]; then
         log_info "Downloading VAD model from whisperX GitHub..."
+        set_status_label "Provisioning:whisperx_vad_download"
         mkdir -p "${wx}/whisperx/assets"
         wget --progress=bar:force \
             -O "$vad" \
@@ -513,6 +595,7 @@ function provisioning_setup_whisperx() {
     mkdir -p /workspace/.cache/huggingface /workspace/.cache/whisper /workspace/.cache/torch
 
     log_info "Pre-downloading Whisper large-v3..."
+    set_status_label "Provisioning:whisper_largev3_download"
     python3 - << 'PYEOF'
 import os
 os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
@@ -527,6 +610,7 @@ PYEOF
 
     if [[ -n "$HF_TOKEN" ]]; then
         log_info "Pre-downloading pyannote diarization models..."
+        set_status_label "Provisioning:pyannote_download"
         python3 - << 'PYEOF'
 import os
 os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
@@ -554,28 +638,44 @@ function provisioning_start() {
 
     install_download_tools
 
-    # ── Speed check: must happen BEFORE any heavy work ──────────────────
-    # measure_download_speed() has NO log calls (pure echo return value).
-    # Logging only happens inside check_speed_and_maybe_terminate().
+    # Speed check — BEFORE any heavy work
     log_info "Measuring network speed..."
+    set_status_label "Provisioning:speed_test"
     local NET_SPEED_MBS
     NET_SPEED_MBS=$(measure_download_speed)
     echo "$NET_SPEED_MBS" > /tmp/_provision_speed
     check_speed_and_maybe_terminate "$NET_SPEED_MBS"
-    # ─────────────────────────────────────────────────────────────────────
 
     setup_output_http_server
-    provisioning_get_apt_packages
-    provisioning_get_nodes
-    provisioning_get_pip_packages
-    provisioning_setup_whisperx
+    setup_tunnels_and_label   # sets TUNNEL_LABEL_PART, sets first label with tunnels
 
+    set_status_label "Provisioning:apt_packages"
+    provisioning_get_apt_packages
+
+    set_status_label "Provisioning:cloning_nodes"
+    provisioning_get_nodes
+
+    set_status_label "Provisioning:pip_packages"
+    provisioning_get_pip_packages
+
+    provisioning_setup_whisperx  # has its own status updates internally
+
+    set_status_label "Provisioning:scanning_models"
     cleanup_corrupted_files "${COMFYUI_DIR}/models"
 
+    set_status_label "Provisioning:loras"
     provisioning_get_files "${COMFYUI_DIR}/models/loras"            "${LORA_MODELS[@]}"
+
+    set_status_label "Provisioning:vae"
     provisioning_get_files "${COMFYUI_DIR}/models/vae"              "${VAE_MODELS[@]}"
+
+    set_status_label "Provisioning:text_encoders"
     provisioning_get_files "${COMFYUI_DIR}/models/text_encoders"    "${TEXT_ENCODER_MODELS[@]}"
+
+    set_status_label "Provisioning:diffusion_models"
     provisioning_get_files "${COMFYUI_DIR}/models/diffusion_models" "${DIFFUSION_MODELS[@]}"
+
+    set_status_label "READY"
 
     log_info "=========================================="
     log_info "  PROVISIONING COMPLETE"
@@ -609,20 +709,20 @@ function provisioning_get_nodes() {
         else
             log_info "──────────────────────────────────────"
             log_info "Cloning node: ${dir}"
-            log_info "From: ${repo}"
-            # No --quiet: show real git output so you can see progress
+            set_status_label "Provisioning:cloning_${dir}"
             git clone "${repo}" "${path}" --recursive 2>&1 | tee -a "$PROVISION_LOG"
             log_info "✓ Cloned: ${dir}"
 
             if [[ -f "${path}/requirements.txt" ]]; then
-                log_info "Installing pip requirements for ${dir}..."
+                log_info "Installing requirements for ${dir}..."
+                set_status_label "Provisioning:pip_${dir}"
                 pip install --no-cache-dir -r "${path}/requirements.txt" 2>&1 | tee -a "$PROVISION_LOG"
                 log_info "✓ Requirements installed for ${dir}"
             fi
         fi
     done
 
-    # Patch WhisperX vad.py: pyannote.audio 3.x removed use_auth_token arg
+    # Patch WhisperX vad.py for pyannote.audio 3.x
     local vad_py="${COMFYUI_DIR}/custom_nodes/ComfyUI-WhisperX/whisperx/vad.py"
     if [[ -f "$vad_py" ]]; then
         log_info "Patching vad.py for pyannote.audio 3.x..."
