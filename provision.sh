@@ -13,10 +13,6 @@ MAX_TIMEOUT=1800
 
 PROVISION_LOG="/var/log/provisioning-detailed.log"
 
-# Auto-terminate if speed is below threshold (MB/s).
-# VASTAI_API_TOKEN must be set in Vast.ai account Settings → Environment Variables.
-# CONTAINER_ID is injected automatically by Vast.ai.
-MIN_SPEED_MBS=30
 
 # Global: tunnel portion of label — set once in setup_tunnels_and_label,
 # then preserved in every subsequent set_status_label call.
@@ -62,61 +58,12 @@ function install_download_tools() {
     log_info "✓ aria2/curl/jq/bc installed"
 
     log_info "Installing pip tools..."
-    pip install --no-cache-dir huggingface-hub[cli] hf_transfer speedtest-cli 2>&1 | tee -a "$PROVISION_LOG"
+    pip install --no-cache-dir huggingface-hub[cli] hf_transfer 2>&1 | tee -a "$PROVISION_LOG"
     export HF_HUB_ENABLE_HF_TRANSFER=1
     log_info "✓ pip tools installed"
 }
 
 # ==================== NETWORK SPEED + AUTO-TERMINATE ====================
-# IMPORTANT: measure_download_speed() uses `echo` to return a value.
-# NEVER call log_info inside it — those get captured by $() and corrupt the result.
-
-function measure_download_speed() {
-    # --bytes makes speedtest-cli report in MB/s directly.
-    # Returns plain integer MB/s. NO log calls.
-    local mbs
-    mbs=$(python3 -m speedtest --simple --bytes 2>/dev/null \
-        | grep "Download:" | awk '{print $2}' | awk -F. '{print $1}')
-    if ! [[ "$mbs" =~ ^[0-9]+$ ]] || [[ "$mbs" -eq 0 ]]; then
-        mbs=999  # measurement failed — never wrongly terminate
-    fi
-    echo "$mbs"
-}
-
-function check_speed_and_maybe_terminate() {
-    local speed_mbs="$1"
-
-    if [[ "$speed_mbs" -lt "$MIN_SPEED_MBS" ]]; then
-        log_error "══════════════════════════════════════════════"
-        log_error "  SLOW NETWORK: ${speed_mbs} MB/s < ${MIN_SPEED_MBS} MB/s"
-        log_error "  Downloads will be extremely slow."
-        log_error "══════════════════════════════════════════════"
-        set_status_label "TERMINATED:slow_network_${speed_mbs}MBs"
-
-        if [[ -n "$VASTAI_API_TOKEN" && -n "$CONTAINER_ID" ]]; then
-            log_warning "Auto-terminating instance ${CONTAINER_ID}..."
-            local response
-            response=$(curl -s -o /dev/null -w "%{http_code}" \
-                -X DELETE \
-                "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/" \
-                -H "Authorization: Bearer ${VASTAI_API_TOKEN}")
-            if [[ "$response" == "200" ]]; then
-                log_info "✓ Termination accepted. Halting."
-            else
-                log_error "Termination returned HTTP ${response}"
-            fi
-            sleep 30
-            exit 1
-        else
-            log_warning "VASTAI_API_TOKEN or CONTAINER_ID not set — skipping auto-terminate."
-        fi
-    else
-        log_info "══════════════════════════════════════════════"
-        log_info "  ✓ NETWORK SPEED OK: ${speed_mbs} MB/s"
-        log_info "══════════════════════════════════════════════"
-    fi
-}
-
 function calculate_timeout() {
     local gb="$1" mbs="$2"
     gb=${gb%%.*}
@@ -359,7 +306,7 @@ function provisioning_download_with_retry() {
     [[ -n "$HF_TOKEN"      && "$url" =~ huggingface\.co ]] && auth_token="$HF_TOKEN"
     [[ -n "$CIVITAI_TOKEN" && "$url" =~ civitai\.com    ]] && auth_token="$CIVITAI_TOKEN"
 
-    local speed_mbs; speed_mbs=$(cat /tmp/_provision_speed 2>/dev/null || echo 50)
+    local speed_mbs=100  # no speed test — use generous default
 
     local file_bytes; file_bytes=$(estimate_file_size_bytes "$url")
     local gb=$(( file_bytes / 1073741824 ))
@@ -408,30 +355,6 @@ function provisioning_download_with_retry() {
 
 # ==================== HTTP SERVER ====================
 
-function setup_output_http_server() {
-    log_info "Setting up output HTTP server on port 8081..."
-    mkdir -p "${COMFYUI_DIR}/output"
-    cat > /etc/supervisor/conf.d/comfyui-output-server.conf << 'EOF'
-[program:comfyui-output-server]
-command=/usr/bin/python3 -m http.server 8081 --bind 0.0.0.0
-directory=/workspace/ComfyUI/output
-autostart=true
-autorestart=true
-redirect_stderr=true
-stdout_logfile=/var/log/comfyui-output-server.log
-stdout_logfile_maxbytes=10MB
-stdout_logfile_backups=3
-priority=999
-EOF
-    supervisorctl reread > /dev/null 2>&1
-    supervisorctl update > /dev/null 2>&1
-    supervisorctl start comfyui-output-server > /dev/null 2>&1
-    sleep 2
-    supervisorctl status comfyui-output-server 2>/dev/null | grep -q RUNNING \
-        && log_info "✅ HTTP server running on port 8081" \
-        || log_warning "HTTP server may not have started"
-}
-
 # ==================== TUNNEL DISCOVERY + LABEL ====================
 
 function setup_tunnels_and_label() {
@@ -443,22 +366,6 @@ function setup_tunnels_and_label() {
 
     local logfile="/var/log/tunnel_manager.log"
     local portal_yaml="/etc/portal.yaml"
-
-    # Add port 8081 to portal config if not already present
-    if [[ -f "$portal_yaml" ]]; then
-        if ! grep -q "8081" "$portal_yaml"; then
-            log_info "Adding port 8081 to /etc/portal.yaml..."
-            # Append to the services list — format: host:ext_port:int_port:path:name
-            # ext_port == int_port means no Caddy proxy, but tunnel is still created
-            echo "  - localhost:8081:8081:/:HTTP Output Server" >> "$portal_yaml"
-            supervisorctl reload 2>&1 | tee -a "$PROVISION_LOG"
-            log_info "✓ portal.yaml updated and supervisor reloaded"
-        else
-            log_info "Port 8081 already in portal.yaml"
-        fi
-    else
-        log_warning "/etc/portal.yaml not found — cannot register tunnel for 8081"
-    fi
 
     # Wait for tunnel_manager to establish all tunnels (up to 60s)
     log_info "Waiting for tunnel_manager to establish tunnels..."
@@ -647,15 +554,6 @@ function provisioning_start() {
 
     install_download_tools
 
-    # Speed check — BEFORE any heavy work
-    log_info "Measuring network speed..."
-    set_status_label "Provisioning:speed_test"
-    local NET_SPEED_MBS
-    NET_SPEED_MBS=$(measure_download_speed)
-    echo "$NET_SPEED_MBS" > /tmp/_provision_speed
-    check_speed_and_maybe_terminate "$NET_SPEED_MBS"
-
-    setup_output_http_server
     setup_tunnels_and_label   # sets TUNNEL_LABEL_PART, sets first label with tunnels
 
     set_status_label "Provisioning:apt_packages"
