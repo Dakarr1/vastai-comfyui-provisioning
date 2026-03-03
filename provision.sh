@@ -355,33 +355,47 @@ function provisioning_download_with_retry() {
 
 # ==================== HTTP SERVER ====================
 
+function setup_output_http_server() {
+    log_info "Setting up output HTTP server on port 8081..."
+    mkdir -p "${COMFYUI_DIR}/output"
+    cat > /etc/supervisor/conf.d/comfyui-output-server.conf << 'SUPEOF'
+[program:comfyui-output-server]
+command=/usr/bin/python3 -m http.server 8081 --bind 0.0.0.0
+directory=/workspace/ComfyUI/output
+autostart=true
+autorestart=true
+redirect_stderr=true
+stdout_logfile=/var/log/comfyui-output-server.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
+priority=999
+SUPEOF
+    supervisorctl reread > /dev/null 2>&1
+    supervisorctl update > /dev/null 2>&1
+    supervisorctl start comfyui-output-server > /dev/null 2>&1
+    sleep 2
+    supervisorctl status comfyui-output-server 2>/dev/null | grep -q RUNNING \
+        && log_info "✅ HTTP server running on port 8081" \
+        || log_warning "HTTP server may not have started"
+}
+
 # ==================== TUNNEL DISCOVERY + LABEL ====================
 
 function setup_tunnels_and_label() {
-    # The correct way to add a tunnel on Vast.ai:
-    # 1. Add the port to /etc/portal.yaml
-    # 2. supervisorctl reload — tunnel_manager creates the tunnel automatically
-    # 3. Wait for the URL to appear in tunnel_manager.log
-    # Never spawn cloudflared directly — tunnel_manager owns it exclusively.
-
     local logfile="/var/log/tunnel_manager.log"
-    local portal_yaml="/etc/portal.yaml"
+    local cf_log="/tmp/cloudflared_8081.log"
 
-    # Wait for tunnel_manager to establish all tunnels (up to 60s)
+    # ── Step 1: wait for tunnel_manager tunnels ──────────────────
     log_info "Waiting for tunnel_manager to establish tunnels..."
     local waited=0
     while [[ $waited -lt 60 ]]; do
-        if grep -q "trycloudflare.com" "$logfile" 2>/dev/null; then
-            break
-        fi
+        grep -q "trycloudflare.com" "$logfile" 2>/dev/null && break
         sleep 3
         (( waited += 3 ))
     done
 
     local tunnels=""
 
-    # Extract ALL port:url pairs from tunnel_manager.log
-    # Each relevant line: [http://localhost:PORT] ... https://xxx.trycloudflare.com
     while IFS= read -r line; do
         local port url
         port=$(echo "$line" | grep -oP '(?<=localhost:)\d+' | head -1)
@@ -389,40 +403,46 @@ function setup_tunnels_and_label() {
         if [[ -n "$port" && -n "$url" ]]; then
             [[ -n "$tunnels" ]] && tunnels="${tunnels},"
             tunnels="${tunnels}${port}:${url}"
-            log_info "✓ Tunnel: ${port} → ${url}"
+            log_info "✓ Tunnel from tunnel_manager: ${port} → ${url}"
         fi
-    done < <(grep 'trycloudflare\.com' "$logfile" 2>/dev/null              | grep -oP 'localhost:\d+' | sort -u | while read -r portpart; do
-                 local_port="${portpart#localhost:}"
-                 url=$(grep "localhost:${local_port}" "$logfile"                        | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
-                 [[ -n "$url" ]] && echo "${local_port}__${url}"
-             done)
+    done < <(grep 'trycloudflare\.com' "$logfile" 2>/dev/null)
 
-    # Simpler fallback extraction if above yields nothing
-    if [[ -z "$tunnels" ]]; then
-        while IFS= read -r line; do
-            local port url
-            port=$(echo "$line" | grep -oP '(?<=localhost:)\d+' | head -1)
-            url=$(echo "$line"  | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)
-            if [[ -n "$port" && -n "$url" ]]; then
-                [[ -n "$tunnels" ]] && tunnels="${tunnels},"
-                tunnels="${tunnels}${port}:${url}"
-                log_info "✓ Tunnel: ${port} → ${url}"
-            fi
-        done < <(grep 'trycloudflare\.com' "$logfile" 2>/dev/null)
+    # ── Step 2: cloudflared tunnel for port 8081 ─────────────────
+    log_info "Starting cloudflared tunnel for port 8081..."
+    rm -f "$cf_log"
+    cloudflared tunnel --url http://localhost:8081 > "$cf_log" 2>&1 &
+    local cf_pid=$!
+    log_info "cloudflared PID: ${cf_pid}"
+
+    local cf_url=""
+    for i in {1..30}; do
+        cf_url=$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' "$cf_log" 2>/dev/null | head -1)
+        if [[ -n "$cf_url" ]]; then
+            log_info "✓ cloudflared 8081 tunnel: ${cf_url}"
+            [[ -n "$tunnels" ]] && tunnels="${tunnels},"
+            tunnels="${tunnels}8081:${cf_url}"
+            break
+        fi
+        sleep 2
+    done
+
+    if [[ -z "$cf_url" ]]; then
+        log_warning "cloudflared tunnel for 8081 timed out — killing process"
+        kill "$cf_pid" 2>/dev/null
+        tail -5 "$cf_log" 2>/dev/null | tee -a "$PROVISION_LOG"
     fi
 
+    # ── Step 3: set label ────────────────────────────────────────
     TUNNEL_LABEL_PART="$tunnels"
 
     if [[ -n "$tunnels" ]]; then
         set_status_label "Provisioning:started"
-        log_info "✓ Label set with all tunnels: ${tunnels}"
+        log_info "✓ Label set: ${tunnels}"
     else
-        log_warning "No tunnel URLs found in tunnel_manager.log — label set without tunnels"
+        log_warning "No tunnels found — label set without tunnels"
         set_status_label "Provisioning:started"
     fi
 }
-
-
 # ==================== PACKAGE DEFINITIONS ====================
 
 APT_PACKAGES=(
@@ -554,6 +574,7 @@ function provisioning_start() {
 
     install_download_tools
 
+    setup_output_http_server
     setup_tunnels_and_label   # sets TUNNEL_LABEL_PART, sets first label with tunnels
 
     set_status_label "Provisioning:apt_packages"
@@ -567,9 +588,6 @@ function provisioning_start() {
 
     provisioning_setup_whisperx  # has its own status updates internally
 
-    set_status_label "Provisioning:scanning_models"
-    cleanup_corrupted_files "${COMFYUI_DIR}/models"
-
     set_status_label "Provisioning:loras"
     provisioning_get_files "${COMFYUI_DIR}/models/loras"            "${LORA_MODELS[@]}"
 
@@ -581,6 +599,9 @@ function provisioning_start() {
 
     set_status_label "Provisioning:diffusion_models"
     provisioning_get_files "${COMFYUI_DIR}/models/diffusion_models" "${DIFFUSION_MODELS[@]}"
+
+    set_status_label "Provisioning:scanning_models"
+    cleanup_corrupted_files "${COMFYUI_DIR}/models"
 
     set_status_label "READY"
 
