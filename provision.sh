@@ -353,6 +353,37 @@ function provisioning_download_with_retry() {
     return 1
 }
 
+# ==================== API WRAPPER TIMEOUT FIX ====================
+
+function fix_api_wrapper_timeout() {
+    local worker="/opt/comfyui-api-wrapper/workers/generation_worker.py"
+
+    if [[ ! -f "$worker" ]]; then
+        log_warning "api-wrapper worker not found at ${worker} — skipping timeout fix"
+        return
+    fi
+
+    log_info "Patching api-wrapper WEBSOCKET_MESSAGE_TIMEOUT..."
+
+    # Inject 'import os' after 'import asyncio' if not already present
+    if ! grep -q "^import os" "$worker"; then
+        sed -i 's/^import asyncio/import asyncio\nimport os/' "$worker"
+    fi
+
+    # Replace hardcoded timeout with env var (default 600s)
+    sed -i 's/message_timeout = [0-9.]*/message_timeout = float(os.getenv("WEBSOCKET_MESSAGE_TIMEOUT", "600.0"))/' "$worker"
+
+    log_info "Timeout patched — restarting api-wrapper..."
+
+    # Kill existing uvicorn
+    kill $(ps aux | grep uvicorn | grep -v grep | awk '{print $2}') 2>/dev/null || true
+    sleep 2
+
+    # Restart on correct port
+    cd /opt/comfyui-api-wrapper && .venv/bin/uvicorn main:app --port 8288 &
+    log_info "api-wrapper restarted on port 8288 (PID: $!)"
+}
+
 # ==================== HTTP SERVER ====================
 
 function setup_output_http_server() {
@@ -447,18 +478,15 @@ function setup_tunnels_and_label() {
 
 APT_PACKAGES=(
     "ffmpeg"
+    "portaudio19-dev"   # required by sounddevice (TTS-Audio-Suite voice recording)
 )
 
 PIP_PACKAGES=(
     "transformers==4.57.3"
-    "openai-whisper"
-    "omegaconf"
 )
 
 NODES=(
-    "https://github.com/ltdrdata/ComfyUI-Manager"
-    "https://github.com/flybirdxx/ComfyUI-Qwen-TTS"
-    "https://github.com/AIFSH/ComfyUI-WhisperX"
+    "https://github.com/diodiogod/TTS-Audio-Suite"
 )
 
 CHECKPOINT_MODELS=()
@@ -490,80 +518,6 @@ CONTROLNET_MODELS=()
 LATENT_UPSCALE_MODELS=()
 WORKFLOWS=()
 
-# ==================== WHISPERX SETUP ====================
-
-function provisioning_setup_whisperx() {
-    log_info "Setting up WhisperX..."
-    set_status_label "Provisioning:whisperx_setup"
-
-    local wx="${COMFYUI_DIR}/custom_nodes/ComfyUI-WhisperX"
-    [[ ! -d "$wx" ]] && { log_warning "ComfyUI-WhisperX not found, skipping"; return; }
-
-    local vad="${wx}/whisperx/assets/pytorch_model.bin"
-    local vad_sha="0b5b3216d60a2d32fc086b47ea8c67589aaeb26b7e07fcbe620d6d0b83e209ea"
-
-    local need_dl=true
-    if [[ -f "$vad" ]]; then
-        local actual; actual=$(sha256sum "$vad" | awk '{print $1}')
-        if [[ "$actual" == "$vad_sha" ]]; then
-            log_info "✓ VAD model already present and verified"
-            need_dl=false
-        else
-            log_warning "VAD checksum mismatch — re-downloading"
-            rm -f "$vad"
-        fi
-    fi
-
-    if [[ "$need_dl" == "true" ]]; then
-        log_info "Downloading VAD model from whisperX GitHub..."
-        set_status_label "Provisioning:whisperx_vad_download"
-        mkdir -p "${wx}/whisperx/assets"
-        wget --progress=bar:force \
-            -O "$vad" \
-            "https://github.com/m-bain/whisperX/raw/main/whisperx/assets/pytorch_model.bin" \
-            2>&1 | tee -a "$PROVISION_LOG" \
-            && log_info "✓ VAD model downloaded" \
-            || log_error "❌ VAD model download failed"
-    fi
-
-    export HF_HOME="/workspace/.cache/huggingface"
-    export TORCH_HOME="/workspace/.cache/torch"
-    mkdir -p /workspace/.cache/huggingface /workspace/.cache/whisper /workspace/.cache/torch
-
-    log_info "Pre-downloading Whisper large-v3..."
-    set_status_label "Provisioning:whisper_largev3_download"
-    python3 - << 'PYEOF'
-import os
-os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
-os.environ['TORCH_HOME'] = '/workspace/.cache/torch'
-try:
-    import whisper
-    whisper.load_model("large-v3", download_root="/workspace/.cache/whisper")
-    print("✓ Whisper large-v3 ready")
-except Exception as e:
-    print(f"⚠ Whisper pre-download failed (will download on first use): {e}")
-PYEOF
-
-    if [[ -n "$HF_TOKEN" ]]; then
-        log_info "Pre-downloading pyannote diarization models..."
-        set_status_label "Provisioning:pyannote_download"
-        python3 - << 'PYEOF'
-import os
-os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
-token = os.environ.get('HF_TOKEN', '')
-try:
-    from pyannote.audio import Pipeline
-    Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
-    print("✓ pyannote speaker-diarization-3.1 ready")
-except Exception as e:
-    print(f"⚠ pyannote pre-download failed (accept licence at hf.co/pyannote): {e}")
-PYEOF
-    else
-        log_info "HF_TOKEN not set — skipping pyannote pre-download"
-    fi
-
-    log_info "✓ WhisperX setup complete"
-}
 
 # ==================== MAIN ====================
 
@@ -575,6 +529,7 @@ function provisioning_start() {
     install_download_tools
 
     setup_output_http_server
+    fix_api_wrapper_timeout
     setup_tunnels_and_label   # sets TUNNEL_LABEL_PART, sets first label with tunnels
 
     set_status_label "Provisioning:apt_packages"
@@ -586,7 +541,6 @@ function provisioning_start() {
     set_status_label "Provisioning:pip_packages"
     provisioning_get_pip_packages
 
-    provisioning_setup_whisperx  # has its own status updates internally
 
     set_status_label "Provisioning:loras"
     provisioning_get_files "${COMFYUI_DIR}/models/loras"            "${LORA_MODELS[@]}"
@@ -641,7 +595,13 @@ function provisioning_get_nodes() {
             git clone "${repo}" "${path}" --recursive 2>&1 | tee -a "$PROVISION_LOG"
             log_info "✓ Cloned: ${dir}"
 
-            if [[ -f "${path}/requirements.txt" ]]; then
+            if [[ -f "${path}/install.py" ]]; then
+                log_info "Running install.py for ${dir}..."
+                set_status_label "Provisioning:pip_${dir}"
+                cd "${path}" && python install.py 2>&1 | tee -a "$PROVISION_LOG"
+                cd - > /dev/null
+                log_info "✓ install.py done for ${dir}"
+            elif [[ -f "${path}/requirements.txt" ]]; then
                 log_info "Installing requirements for ${dir}..."
                 set_status_label "Provisioning:pip_${dir}"
                 pip install --no-cache-dir -r "${path}/requirements.txt" 2>&1 | tee -a "$PROVISION_LOG"
@@ -650,14 +610,7 @@ function provisioning_get_nodes() {
         fi
     done
 
-    # Patch WhisperX vad.py for pyannote.audio 3.x
-    local vad_py="${COMFYUI_DIR}/custom_nodes/ComfyUI-WhisperX/whisperx/vad.py"
-    if [[ -f "$vad_py" ]]; then
-        log_info "Patching vad.py for pyannote.audio 3.x..."
-        sed -i 's/vad_model = Model.from_pretrained(model_fp, use_auth_token=use_auth_token)/vad_model = Model.from_pretrained(model_fp)/' "$vad_py"
-        sed -i 's/super().__init__(segmentation=segmentation, fscore=fscore, use_auth_token=use_auth_token, \*\*inference_kwargs)/super().__init__(segmentation=segmentation, fscore=fscore, **inference_kwargs)/' "$vad_py"
-        log_info "✓ vad.py patched"
-    fi
+
 }
 
 function provisioning_get_files() {
