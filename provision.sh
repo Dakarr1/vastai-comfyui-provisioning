@@ -256,17 +256,35 @@ function download_with_hf_cli() {
         local repo="${BASH_REMATCH[1]}" rev="${BASH_REMATCH[2]}" file="${BASH_REMATCH[3]}"
         log_info "HF CLI: ${repo}/${file}"
 
-        HF_HUB_ENABLE_HF_TRANSFER=1 hf download \
-            "$repo" "$file" --revision "$rev" \
-            --local-dir "$dir" --local-dir-use-symlinks False \
-            --resume-download 2>&1 \
-            | grep -v "FutureWarning" | grep -v "^$" \
-            | tee -a "$PROVISION_LOG"
+        # Detect hf CLI version to use correct flags
+        # New versions (>=0.24) removed --local-dir-use-symlinks and --resume-download
+        local hf_ver
+        hf_ver=$(hf version 2>/dev/null | grep -oP '[\d]+\.[\d]+' | head -1)
+        local major minor
+        major=$(echo "$hf_ver" | cut -d. -f1)
+        minor=$(echo "$hf_ver" | cut -d. -f2)
+
+        local extra_flags=""
+        if [[ -z "$hf_ver" || "$major" -lt 1 && "$minor" -lt 24 ]] 2>/dev/null; then
+            # Old CLI — use legacy flags
+            extra_flags="--local-dir-use-symlinks False --resume-download"
+        fi
+
+        HF_HUB_ENABLE_HF_TRANSFER=1 hf download             "$repo" "$file" --revision "$rev"             --local-dir "$dir"             $extra_flags 2>&1             | grep -v "FutureWarning" | grep -v "^$"             | tee -a "$PROVISION_LOG"
 
         local ec=${PIPESTATUS[0]}
+        # hf download places file at dir/file (may include subdirs from repo)
         local dl="${dir}/${file}"
         if [[ $ec -eq 0 && -f "$dl" ]]; then
             [[ "$dl" != "${dir}/${filename}" ]] && mv "$dl" "${dir}/${filename}" 2>/dev/null
+            find "$dir" -type d -empty -delete 2>/dev/null
+            return 0
+        fi
+        # Fallback: search for the file anywhere under dir
+        local found
+        found=$(find "$dir" -name "$filename" -type f 2>/dev/null | head -1)
+        if [[ -n "$found" ]]; then
+            [[ "$found" != "${dir}/${filename}" ]] && mv "$found" "${dir}/${filename}" 2>/dev/null
             find "$dir" -type d -empty -delete 2>/dev/null
             return 0
         fi
@@ -487,6 +505,7 @@ PIP_PACKAGES=(
 
 NODES=(
     "https://github.com/diodiogod/TTS-Audio-Suite"
+    "https://github.com/SeanScripts/ComfyUI-Unload-Model"
 )
 
 CHECKPOINT_MODELS=()
