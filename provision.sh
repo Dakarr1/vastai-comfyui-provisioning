@@ -474,22 +474,42 @@ function setup_tunnels_and_label() {
     fi
 
     # ── Step 3: extract all port:url pairs from tunnel_manager.log ─
+    # Two formats exist in tunnel_manager.log:
+    #   Format A: "Default Tunnel started for http://localhost:PORT - https://URL?token=..."
+    #   Format B: "[http://localhost:PORT] ... INF |  https://URL  |"
+    # Both have port and URL on the same line — extract both reliably.
     local tunnels=""
     local seen_ports=""
 
-    while IFS= read -r line; do
-        local port url
-        port=$(echo "$line" | grep -oP '(?<=localhost:)\d+' | head -1)
-        url=$(echo "$line"  | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)
-        if [[ -n "$port" && -n "$url" ]]; then
-            # Deduplicate ports (tunnel_manager may log the same port multiple times)
-            if [[ "$seen_ports" != *"|${port}|"* ]]; then
-                seen_ports="${seen_ports}|${port}|"
-                [[ -n "$tunnels" ]] && tunnels="${tunnels},"
-                tunnels="${tunnels}${port}:${url}"
-                log_info "✓ Tunnel: ${port} → ${url}"
-            fi
+    _add_tunnel() {
+        local port="$1" url="$2"
+        [[ -z "$port" || -z "$url" ]] && return
+        if [[ "$seen_ports" != *"|${port}|"* ]]; then
+            seen_ports="${seen_ports}|${port}|"
+            [[ -n "$tunnels" ]] && tunnels="${tunnels},"
+            tunnels="${tunnels}${port}:${url}"
+            log_info "✓ Tunnel: ${port} → ${url}"
         fi
+    }
+
+    while IFS= read -r line; do
+        local port="" url=""
+
+        # Format A: "Default Tunnel started for http://localhost:PORT - https://URL"
+        if [[ "$line" =~ localhost:([0-9]+)[[:space:]]+-[[:space:]]+(https://[a-z0-9-]+\.trycloudflare\.com) ]]; then
+            port="${BASH_REMATCH[1]}"
+            url="${BASH_REMATCH[2]}"
+        # Format B: "[http://localhost:PORT] ... https://URL"
+        elif [[ "$line" =~ \[http://localhost:([0-9]+)\].*\|([[:space:]])(https://[a-z0-9-]+\.trycloudflare\.com) ]]; then
+            port="${BASH_REMATCH[1]}"
+            url="${BASH_REMATCH[3]}"
+        # Fallback: any line with both localhost:PORT and a trycloudflare URL
+        else
+            port=$(echo "$line" | grep -oP '(?<=localhost:)\d+' | head -1)
+            url=$(echo "$line"  | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)
+        fi
+
+        _add_tunnel "$port" "$url"
     done < <(grep 'trycloudflare\.com' "$logfile" 2>/dev/null)
 
     # ── Step 4: cloudflared tunnel for port 8081 ─────────────────
