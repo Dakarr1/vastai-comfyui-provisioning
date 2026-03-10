@@ -434,29 +434,65 @@ function setup_tunnels_and_label() {
     local logfile="/var/log/tunnel_manager.log"
     local cf_log="/tmp/cloudflared_8081.log"
 
-    # ── Step 1: wait for tunnel_manager tunnels ──────────────────
-    log_info "Waiting for tunnel_manager to establish tunnels..."
+    # ── Step 1: count expected ports from PORTAL_CONFIG ──────────
+    # PORTAL_CONFIG format: localhost:PUBPORT:PRIVPORT:PATH:NAME|...
+    # We count unique public ports that tunnel_manager will create tunnels for.
+    local expected_count=0
+    if [[ -n "$PORTAL_CONFIG" ]]; then
+        expected_count=$(echo "$PORTAL_CONFIG" \
+            | tr '|' '\n' \
+            | grep -oP 'localhost:\K\d+' \
+            | sort -u \
+            | wc -l)
+        log_info "Expecting ${expected_count} unique tunnel(s) from PORTAL_CONFIG"
+    fi
+    # Fallback: at least 1
+    [[ $expected_count -lt 1 ]] && expected_count=1
+
+    # ── Step 2: wait until all expected tunnels appear ────────────
+    # Poll the log, re-read on each iteration so we catch tunnels as they appear.
+    # Max wait: 90s (well within n8n 2m30s timeout — cloudflared 8081 adds ~30s more)
+    log_info "Waiting for tunnel_manager to establish all tunnels..."
     local waited=0
-    while [[ $waited -lt 60 ]]; do
-        grep -q "trycloudflare.com" "$logfile" 2>/dev/null && break
+    local found_count=0
+    while [[ $waited -lt 90 ]]; do
+        found_count=$(grep 'trycloudflare\.com' "$logfile" 2>/dev/null \
+            | grep -oP '(?<=localhost:)\d+' \
+            | sort -u \
+            | wc -l)
+        if [[ $found_count -ge $expected_count ]]; then
+            log_info "✓ All ${found_count}/${expected_count} tunnels found after ${waited}s"
+            break
+        fi
+        log_info "Tunnels so far: ${found_count}/${expected_count} — waiting... (${waited}s)"
         sleep 3
         (( waited += 3 ))
     done
 
+    if [[ $found_count -lt $expected_count ]]; then
+        log_warning "Timeout — only ${found_count}/${expected_count} tunnels found, proceeding anyway"
+    fi
+
+    # ── Step 3: extract all port:url pairs from tunnel_manager.log ─
     local tunnels=""
+    local seen_ports=""
 
     while IFS= read -r line; do
         local port url
         port=$(echo "$line" | grep -oP '(?<=localhost:)\d+' | head -1)
         url=$(echo "$line"  | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)
         if [[ -n "$port" && -n "$url" ]]; then
-            [[ -n "$tunnels" ]] && tunnels="${tunnels},"
-            tunnels="${tunnels}${port}:${url}"
-            log_info "✓ Tunnel from tunnel_manager: ${port} → ${url}"
+            # Deduplicate ports (tunnel_manager may log the same port multiple times)
+            if [[ "$seen_ports" != *"|${port}|"* ]]; then
+                seen_ports="${seen_ports}|${port}|"
+                [[ -n "$tunnels" ]] && tunnels="${tunnels},"
+                tunnels="${tunnels}${port}:${url}"
+                log_info "✓ Tunnel: ${port} → ${url}"
+            fi
         fi
     done < <(grep 'trycloudflare\.com' "$logfile" 2>/dev/null)
 
-    # ── Step 2: cloudflared tunnel for port 8081 ─────────────────
+    # ── Step 4: cloudflared tunnel for port 8081 ─────────────────
     log_info "Starting cloudflared tunnel for port 8081..."
     rm -f "$cf_log"
     cloudflared tunnel --url http://localhost:8081 > "$cf_log" 2>&1 &
@@ -481,7 +517,7 @@ function setup_tunnels_and_label() {
         tail -5 "$cf_log" 2>/dev/null | tee -a "$PROVISION_LOG"
     fi
 
-    # ── Step 3: set label ────────────────────────────────────────
+    # ── Step 5: set label ─────────────────────────────────────────
     TUNNEL_LABEL_PART="$tunnels"
 
     if [[ -n "$tunnels" ]]; then
