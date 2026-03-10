@@ -435,10 +435,6 @@ function setup_tunnels_and_label() {
     local cf_log="/tmp/cloudflared_8081.log"
 
     # ── Step 1: count expected ports from PORTAL_CONFIG ──────────
-    # We wait specifically for "Default Tunnel started" lines —
-    # these are written AFTER the tunnel is fully established and contain
-    # both port and URL on the same line. Banner lines appear earlier but
-    # are unreliable for extraction.
     local expected_count=0
     if [[ -n "$PORTAL_CONFIG" ]]; then
         expected_count=$(echo "$PORTAL_CONFIG" \
@@ -450,31 +446,58 @@ function setup_tunnels_and_label() {
     fi
     [[ $expected_count -lt 1 ]] && expected_count=1
 
-    # ── Step 2: wait until all "Default Tunnel started" lines appear ─
-    log_info "Waiting for tunnel_manager 'Default Tunnel started' lines..."
+    # ── Step 2: baseline — how many "Default Tunnel started" already exist ─
+    # We count specific lines (not total lines) so even if tunnel_manager
+    # already wrote some lines before we started, we only care about NEW tunnels.
+    local baseline=0
+    baseline=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || echo 0)
+    log_info "Baseline: ${baseline} existing 'Default Tunnel started' lines in log"
+
+    # ── Step 3: wait for NEW "Default Tunnel started" lines ───────
+    # Cloudflare may 429 some tunnels — don't wait forever.
+    # Accept whatever arrives within 45s, or stop early if count stable for 9s.
+    log_info "Waiting for new tunnel lines (max 45s)..."
     local waited=0
-    local found_count=0
-    while [[ $waited -lt 90 ]]; do
-        found_count=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || echo 0)
-        if [[ $found_count -ge $expected_count ]]; then
-            log_info "✓ All ${found_count}/${expected_count} tunnels ready after ${waited}s"
+    local current=0
+    local last_new=0
+    local stable_for=0
+    while [[ $waited -lt 45 ]]; do
+        current=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || echo 0)
+        local new_count=$(( current - baseline ))
+        if [[ $new_count -ge $expected_count ]]; then
+            log_info "✓ All ${new_count}/${expected_count} tunnels ready after ${waited}s"
             break
         fi
-        log_info "Tunnels ready: ${found_count}/${expected_count} — waiting... (${waited}s)"
+        # If count hasn't changed for 9s, Cloudflare probably 429'd the rest
+        if [[ $new_count -eq $last_new ]]; then
+            (( stable_for += 3 ))
+            if [[ $stable_for -ge 9 && $new_count -gt 0 ]]; then
+                log_warning "Count stable at ${new_count}/${expected_count} for 9s — likely 429 on rest, proceeding"
+                break
+            fi
+        else
+            stable_for=0
+            last_new=$new_count
+        fi
+        log_info "New tunnels: ${new_count}/${expected_count} — waiting... (${waited}s)"
         sleep 3
         (( waited += 3 ))
     done
 
-    if [[ $found_count -lt $expected_count ]]; then
-        log_warning "Timeout — only ${found_count}/${expected_count} ready, proceeding anyway"
-    fi
+    local final_new=$(( $(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || echo 0) - baseline ))
+    log_info "Proceeding with ${final_new} new tunnel(s)"
 
-    # ── Step 3: extract from "Default Tunnel started" lines ───────
-    # Format: "Default Tunnel started for http(s)://localhost:PORT - https://URL?token=..."
+    # ── Step 4: extract ONLY new "Default Tunnel started" lines ──
+    # Skip first $baseline matches, take the rest
     local tunnels=""
     local seen_ports=""
+    local skip=$baseline
 
     while IFS= read -r line; do
+        if [[ $skip -gt 0 ]]; then
+            (( skip-- ))
+            continue
+        fi
         local port="" url=""
         if [[ "$line" =~ Default\ Tunnel\ started\ for\ https?://localhost:([0-9]+)\ -\ (https://[a-z0-9-]+\.trycloudflare\.com) ]]; then
             port="${BASH_REMATCH[1]}"
@@ -488,7 +511,7 @@ function setup_tunnels_and_label() {
         fi
     done < <(grep 'Default Tunnel started for' "$logfile" 2>/dev/null)
 
-    # ── Step 4: cloudflared tunnel for port 8081 ─────────────────
+    # ── Step 5: cloudflared tunnel for port 8081 ─────────────────
     log_info "Starting cloudflared tunnel for port 8081..."
     rm -f "$cf_log"
     cloudflared tunnel --url http://localhost:8081 > "$cf_log" 2>&1 &
@@ -496,7 +519,7 @@ function setup_tunnels_and_label() {
     log_info "cloudflared PID: ${cf_pid}"
 
     local cf_url=""
-    for i in {1..30}; do
+    for i in {1..20}; do
         cf_url=$(grep -o 'https://[-a-z0-9.]*\.trycloudflare\.com' "$cf_log" 2>/dev/null | head -1)
         if [[ -n "$cf_url" ]]; then
             log_info "✓ cloudflared 8081 tunnel: ${cf_url}"
@@ -504,16 +527,21 @@ function setup_tunnels_and_label() {
             tunnels="${tunnels}8081:${cf_url}"
             break
         fi
+        # Check if cloudflared already failed with 429
+        if grep -q '429\|Too Many Requests\|failed to\|context deadline' "$cf_log" 2>/dev/null; then
+            log_warning "cloudflared 8081 failed (429 or error) — skipping"
+            kill "$cf_pid" 2>/dev/null
+            break
+        fi
         sleep 2
     done
 
     if [[ -z "$cf_url" ]]; then
-        log_warning "cloudflared tunnel for 8081 timed out — killing process"
+        log_warning "cloudflared tunnel for 8081 not available"
         kill "$cf_pid" 2>/dev/null
-        tail -5 "$cf_log" 2>/dev/null | tee -a "$PROVISION_LOG"
     fi
 
-    # ── Step 5: set label ─────────────────────────────────────────
+    # ── Step 6: set label ─────────────────────────────────────────
     TUNNEL_LABEL_PART="$tunnels"
 
     if [[ -n "$tunnels" ]]; then
