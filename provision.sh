@@ -435,8 +435,10 @@ function setup_tunnels_and_label() {
     local cf_log="/tmp/cloudflared_8081.log"
 
     # ── Step 1: count expected ports from PORTAL_CONFIG ──────────
-    # PORTAL_CONFIG format: localhost:PUBPORT:PRIVPORT:PATH:NAME|...
-    # We count unique public ports that tunnel_manager will create tunnels for.
+    # We wait specifically for "Default Tunnel started" lines —
+    # these are written AFTER the tunnel is fully established and contain
+    # both port and URL on the same line. Banner lines appear earlier but
+    # are unreliable for extraction.
     local expected_count=0
     if [[ -n "$PORTAL_CONFIG" ]]; then
         expected_count=$(echo "$PORTAL_CONFIG" \
@@ -444,73 +446,47 @@ function setup_tunnels_and_label() {
             | grep -oP 'localhost:\K\d+' \
             | sort -u \
             | wc -l)
-        log_info "Expecting ${expected_count} unique tunnel(s) from PORTAL_CONFIG"
+        log_info "Expecting ${expected_count} tunnel(s) from PORTAL_CONFIG"
     fi
-    # Fallback: at least 1
     [[ $expected_count -lt 1 ]] && expected_count=1
 
-    # ── Step 2: wait until all expected tunnels appear ────────────
-    # Poll the log, re-read on each iteration so we catch tunnels as they appear.
-    # Max wait: 90s (well within n8n 2m30s timeout — cloudflared 8081 adds ~30s more)
-    log_info "Waiting for tunnel_manager to establish all tunnels..."
+    # ── Step 2: wait until all "Default Tunnel started" lines appear ─
+    log_info "Waiting for tunnel_manager 'Default Tunnel started' lines..."
     local waited=0
     local found_count=0
     while [[ $waited -lt 90 ]]; do
-        found_count=$(grep 'trycloudflare\.com' "$logfile" 2>/dev/null \
-            | grep -oP '(?<=localhost:)\d+' \
-            | sort -u \
-            | wc -l)
+        found_count=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || echo 0)
         if [[ $found_count -ge $expected_count ]]; then
-            log_info "✓ All ${found_count}/${expected_count} tunnels found after ${waited}s"
+            log_info "✓ All ${found_count}/${expected_count} tunnels ready after ${waited}s"
             break
         fi
-        log_info "Tunnels so far: ${found_count}/${expected_count} — waiting... (${waited}s)"
+        log_info "Tunnels ready: ${found_count}/${expected_count} — waiting... (${waited}s)"
         sleep 3
         (( waited += 3 ))
     done
 
     if [[ $found_count -lt $expected_count ]]; then
-        log_warning "Timeout — only ${found_count}/${expected_count} tunnels found, proceeding anyway"
+        log_warning "Timeout — only ${found_count}/${expected_count} ready, proceeding anyway"
     fi
 
-    # ── Step 3: extract all port:url pairs from tunnel_manager.log ─
-    # Two formats exist in tunnel_manager.log:
-    #   Format A: "Default Tunnel started for http://localhost:PORT - https://URL?token=..."
-    #   Format B: "[http://localhost:PORT] ... INF |  https://URL  |"
-    # Both have port and URL on the same line — extract both reliably.
+    # ── Step 3: extract from "Default Tunnel started" lines ───────
+    # Format: "Default Tunnel started for http(s)://localhost:PORT - https://URL?token=..."
     local tunnels=""
     local seen_ports=""
 
-    _add_tunnel() {
-        local port="$1" url="$2"
-        [[ -z "$port" || -z "$url" ]] && return
-        if [[ "$seen_ports" != *"|${port}|"* ]]; then
-            seen_ports="${seen_ports}|${port}|"
-            [[ -n "$tunnels" ]] && tunnels="${tunnels},"
-            tunnels="${tunnels}${port}:${url}"
-            log_info "✓ Tunnel: ${port} → ${url}"
-        fi
-    }
-
     while IFS= read -r line; do
         local port="" url=""
-
-        # Format A: "Default Tunnel started for http://localhost:PORT - https://URL"
-        if [[ "$line" =~ localhost:([0-9]+)[[:space:]]+-[[:space:]]+(https://[a-z0-9-]+\.trycloudflare\.com) ]]; then
+        if [[ "$line" =~ Default\ Tunnel\ started\ for\ https?://localhost:([0-9]+)\ -\ (https://[a-z0-9-]+\.trycloudflare\.com) ]]; then
             port="${BASH_REMATCH[1]}"
             url="${BASH_REMATCH[2]}"
-        # Format B: "[http://localhost:PORT] ... https://URL"
-        elif [[ "$line" =~ \[http://localhost:([0-9]+)\].*\|([[:space:]])(https://[a-z0-9-]+\.trycloudflare\.com) ]]; then
-            port="${BASH_REMATCH[1]}"
-            url="${BASH_REMATCH[3]}"
-        # Fallback: any line with both localhost:PORT and a trycloudflare URL
-        else
-            port=$(echo "$line" | grep -oP '(?<=localhost:)\d+' | head -1)
-            url=$(echo "$line"  | grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1)
+            if [[ -n "$port" && -n "$url" && "$seen_ports" != *"|${port}|"* ]]; then
+                seen_ports="${seen_ports}|${port}|"
+                [[ -n "$tunnels" ]] && tunnels="${tunnels},"
+                tunnels="${tunnels}${port}:${url}"
+                log_info "✓ Tunnel: ${port} → ${url}"
+            fi
         fi
-
-        _add_tunnel "$port" "$url"
-    done < <(grep 'trycloudflare\.com' "$logfile" 2>/dev/null)
+    done < <(grep 'Default Tunnel started for' "$logfile" 2>/dev/null)
 
     # ── Step 4: cloudflared tunnel for port 8081 ─────────────────
     log_info "Starting cloudflared tunnel for port 8081..."
