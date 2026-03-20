@@ -294,8 +294,8 @@ function download_with_hf_cli() {
 }
 
 function provisioning_download_with_retry() {
-    local url="$1" dir="$2"
-    local filename; filename=$(basename "$url" | sed 's/?.*//')
+    local url="$1" dir="$2" override_name="${3:-}"
+    local filename; filename=$(basename "$url" | sed 's/?.*//'); [[ -n "$override_name" ]] && filename="$override_name"
     local filepath="${dir}/${filename}"
 
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -454,7 +454,8 @@ function setup_tunnels_and_label() {
     local waited=0
     local found=0
     while [[ $waited -lt 45 ]]; do
-        found=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || echo 0)
+        found=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || true)
+        found="${found//[^0-9]/}"; found="${found:-0}"
         if [[ $found -ge $expected_count ]]; then
             log_info "✓ ${found}/${expected_count} tunnel lines found after ${waited}s"
             break
@@ -463,7 +464,8 @@ function setup_tunnels_and_label() {
         if [[ $waited -ge 9 && $found -gt 0 ]]; then
             local prev=$found
             sleep 3
-            local now=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || echo 0)
+            local now; now=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || true)
+            now="${now//[^0-9]/}"; now="${now:-0}"
             if [[ $now -eq $prev ]]; then
                 log_warning "Count stable at ${found}/${expected_count} — likely 429 on rest, proceeding"
                 found=$now
@@ -548,7 +550,8 @@ PIP_PACKAGES=(
 
 NODES=(
     "https://github.com/diodiogod/TTS-Audio-Suite"
-    "https://github.com/SeanScripts/ComfyUI-Unload-Model"
+    "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation"
+    "https://github.com/kijai/ComfyUI-KJNodes"
 )
 
 CHECKPOINT_MODELS=()
@@ -557,6 +560,13 @@ UNET_MODELS=()
 LORA_MODELS=(
     "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
     "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
+    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Stable-Video-Infinity/v2.0/SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors"
+    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/LoRAs/Stable-Video-Infinity/v2.0/SVI_v2_PRO_Wan2.2-I2V-A14B_HIGH_lora_rank_128_fp16.safetensors"
+)
+
+# clip_vision: pipe-separated "url|target_filename"
+CLIP_VISION_MODELS=(
+    "https://huggingface.co/h94/IP-Adapter/resolve/main/models/image_encoder/model.safetensors|clip_vision_h.safetensors"
 )
 
 VAE_MODELS=(
@@ -575,7 +585,9 @@ DIFFUSION_MODELS=(
     "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
 )
 
-ESRGAN_MODELS=()
+ESRGAN_MODELS=(
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
+)
 CONTROLNET_MODELS=()
 LATENT_UPSCALE_MODELS=()
 WORKFLOWS=()
@@ -607,6 +619,9 @@ function provisioning_start() {
     set_status_label "Provisioning:loras"
     provisioning_get_files "${COMFYUI_DIR}/models/loras"            "${LORA_MODELS[@]}"
 
+    set_status_label "Provisioning:clip_vision"
+    provisioning_get_clip_vision "${COMFYUI_DIR}/models/clip_vision" "${CLIP_VISION_MODELS[@]}"
+
     set_status_label "Provisioning:vae"
     provisioning_get_files "${COMFYUI_DIR}/models/vae"              "${VAE_MODELS[@]}"
 
@@ -615,6 +630,9 @@ function provisioning_start() {
 
     set_status_label "Provisioning:diffusion_models"
     provisioning_get_files "${COMFYUI_DIR}/models/diffusion_models" "${DIFFUSION_MODELS[@]}"
+
+    set_status_label "Provisioning:upscale_models"
+    provisioning_get_files "${COMFYUI_DIR}/models/upscale_models"   "${ESRGAN_MODELS[@]}"
 
     set_status_label "Provisioning:scanning_models"
     cleanup_corrupted_files "${COMFYUI_DIR}/models"
@@ -673,6 +691,19 @@ function provisioning_get_nodes() {
     done
 
 
+}
+
+function provisioning_get_clip_vision() {
+    local dir="$1"; shift
+    local arr=("$@")
+    [[ ${#arr[@]} -eq 0 ]] && return 0
+    mkdir -p "$dir"
+    for entry in "${arr[@]}"; do
+        local url="${entry%%|*}"
+        local target="${entry##*|}"
+        [[ "$url" == "$target" ]] && target=""  # no pipe = no rename
+        provisioning_download_with_retry "$url" "$dir" "$target"
+    done
 }
 
 function provisioning_get_files() {
