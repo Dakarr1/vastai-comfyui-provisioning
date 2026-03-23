@@ -446,43 +446,46 @@ function setup_tunnels_and_label() {
     fi
     [[ $expected_count -lt 1 ]] && expected_count=1
 
-    # ── Step 2: wait until we have enough "Default Tunnel started" lines ─
-    # tunnel_manager writes these lines when tunnels are ready.
-    # By the time provision.sh runs, most/all are already written.
-    # We just wait in case some are still coming (e.g. slow CF response).
-    log_info "Waiting for 'Default Tunnel started' lines in log..."
+    # ── Step 2: wait for tunnel_manager log to stabilize ─────────
+    # Strategy: poll every 3s; once we hit expected_count we stop early.
+    # If count stops growing for 9s we also stop (CF 429'd the rest).
+    # Hard cap 90s so we never hang forever.
+    log_info "Waiting for tunnel_manager log to stabilize (max 90s)..."
     local waited=0
-    local found=0
-    while [[ $waited -lt 45 ]]; do
-        found=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || true)
-        found="${found//[^0-9]/}"; found="${found:-0}"
-        if [[ $found -ge $expected_count ]]; then
-            log_info "✓ ${found}/${expected_count} tunnel lines found after ${waited}s"
+    local prev_count=-1
+    local stable_for=0
+    local cur_count=0
+
+    while [[ $waited -lt 90 ]]; do
+        cur_count=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null) || true
+        cur_count=$(echo "$cur_count" | tr -dc '0-9'); cur_count=${cur_count:-0}
+
+        if [[ $cur_count -ge $expected_count ]]; then
+            log_info "✓ Got ${cur_count}/${expected_count} tunnel lines after ${waited}s"
             break
         fi
-        # If we have some and count hasn't grown for 9s, CF probably 429'd the rest
-        if [[ $waited -ge 9 && $found -gt 0 ]]; then
-            local prev=$found
-            sleep 3
-            local now; now=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null || true)
-            now="${now//[^0-9]/}"; now="${now:-0}"
-            if [[ $now -eq $prev ]]; then
-                log_warning "Count stable at ${found}/${expected_count} — likely 429 on rest, proceeding"
-                found=$now
+
+        if [[ $cur_count -eq $prev_count ]]; then
+            (( stable_for += 3 ))
+            if [[ $cur_count -gt 0 && $stable_for -ge 9 ]]; then
+                log_warning "Count stable at ${cur_count}/${expected_count} for 9s — CF likely 429'd the rest, proceeding"
                 break
             fi
-            (( waited += 3 ))
-            continue
+        else
+            stable_for=0
         fi
-        log_info "Found ${found}/${expected_count} — waiting... (${waited}s)"
+
+        log_info "Tunnel lines: ${cur_count}/${expected_count} — waiting... (${waited}s)"
+        prev_count=$cur_count
         sleep 3
         (( waited += 3 ))
     done
 
-    [[ $found -eq 0 ]] && log_warning "No 'Default Tunnel started' lines found after ${waited}s"
+    cur_count=$(grep -c 'Default Tunnel started for' "$logfile" 2>/dev/null) || true
+    cur_count=$(echo "$cur_count" | tr -dc '0-9'); cur_count=${cur_count:-0}
+    log_info "Final tunnel line count: ${cur_count}"
 
     # ── Step 3: extract ALL "Default Tunnel started" lines ───────
-    # Format: "Default Tunnel started for http(s)://localhost:PORT - https://URL?token=..."
     local tunnels=""
     local seen_ports=""
 
