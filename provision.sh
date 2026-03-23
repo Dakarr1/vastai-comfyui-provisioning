@@ -469,9 +469,13 @@ function setup_tunnels_and_label() {
     local cur_count=0
 
     while [[ $waited -lt 90 ]]; do
-        # grep 'pat1' | grep 'pat2' | wc -l — always returns a number, never fails
+        # Count UNIQUE ports that have a trycloudflare URL on the same line.
+        # Each tunnel produces multiple matching lines (banner + summary),
+        # so we must deduplicate by port — not count raw lines.
         cur_count=$(grep 'localhost:' "$logfile" 2>/dev/null \
                     | grep 'trycloudflare\.com' \
+                    | grep -oP '(?<=localhost:)\d+' \
+                    | sort -u \
                     | wc -l)
         cur_count=$(safe_int "$cur_count")
 
@@ -496,12 +500,14 @@ function setup_tunnels_and_label() {
         (( waited += 3 )) || true
     done
 
-    # Final read
+    # Final read — unique ports
     cur_count=$(grep 'localhost:' "$logfile" 2>/dev/null \
                 | grep 'trycloudflare\.com' \
+                | grep -oP '(?<=localhost:)\d+' \
+                | sort -u \
                 | wc -l)
     cur_count=$(safe_int "$cur_count")
-    log_info "Proceeding with ${cur_count} tunnel line(s) in log"
+    log_info "Proceeding with ${cur_count} unique tunnel port(s) in log"
 
     # ── Step 3: extract port:url pairs ───────────────────────────
     # For each line that has both localhost:PORT and a trycloudflare URL,
