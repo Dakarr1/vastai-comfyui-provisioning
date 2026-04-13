@@ -582,6 +582,99 @@ function setup_tunnels_and_label() {
     fi
 }
 
+# ==================== COMFYUI VERSION CHECK + UPDATE ====================
+
+# Helper script written to disk to avoid quoting issues inside $()
+_CM_VERSION_SCRIPT="/tmp/_comfy_version_check.py"
+cat > "$_CM_VERSION_SCRIPT" << 'PYEOF_INNER'
+import sys, re
+try:
+    with open(sys.argv[1]) as f:
+        txt = f.read()
+    m = re.search(r'__version__\s*=\s*["\x27]([0-9]+\.[0-9]+\.?[0-9]*)', txt)
+    print(m.group(1) if m else '')
+except:
+    print('')
+PYEOF_INNER
+
+function update_comfyui_if_needed() {
+    local required_major=0 required_minor=17 required_patch=1
+    local cm_cli="${COMFYUI_DIR}/custom_nodes/ComfyUI-Manager/cm-cli.py"
+    local version_file="${COMFYUI_DIR}/comfy/version.py"
+
+    if [[ ! -f "$version_file" ]]; then
+        log_warning "ComfyUI version file not found — skipping version check"
+        return 0
+    fi
+
+    local version
+    version=$(python3 "$_CM_VERSION_SCRIPT" "$version_file" 2>/dev/null)
+
+    if [[ -z "$version" ]]; then
+        log_warning "Cannot parse ComfyUI version — skipping"
+        return 0
+    fi
+    log_info "ComfyUI version: ${version}"
+
+    local cur_major cur_minor cur_patch
+    IFS='.' read -r cur_major cur_minor cur_patch <<< "$version"
+    cur_major=$(safe_int "$cur_major")
+    cur_minor=$(safe_int "$cur_minor")
+    cur_patch=$(safe_int "${cur_patch:-0}")
+
+    local needs_update=false
+    if   [[ $cur_major -lt $required_major ]]; then needs_update=true
+    elif [[ $cur_major -eq $required_major && $cur_minor -lt $required_minor ]]; then needs_update=true
+    elif [[ $cur_major -eq $required_major && $cur_minor -eq $required_minor && $cur_patch -lt $required_patch ]]; then needs_update=true
+    fi
+
+    if [[ "$needs_update" == "false" ]]; then
+        log_info "✓ ComfyUI ${version} >= ${required_major}.${required_minor}.${required_patch} — no update needed"
+        return 0
+    fi
+
+    log_info "ComfyUI ${version} < ${required_major}.${required_minor}.${required_patch} — updating via ComfyUI-Manager..."
+
+    if [[ ! -f "$cm_cli" ]]; then
+        log_warning "cm-cli.py not found — cannot update via Manager"
+        return 0
+    fi
+
+    COMFYUI_PATH="${COMFYUI_DIR}" python3 "$cm_cli" update ComfyUI 2>&1 | tee -a "$PROVISION_LOG" || true
+
+    local new_version
+    new_version=$(python3 "$_CM_VERSION_SCRIPT" "$version_file" 2>/dev/null)
+    log_info "✓ ComfyUI updated to ${new_version:-unknown}"
+}
+
+# ==================== CLEANUP UNWANTED AUTO-INSTALLED MODELS ====================
+
+function remove_unwanted_models() {
+    local checkpoints_dir="${COMFYUI_DIR}/models/checkpoints"
+    log_info "Removing unwanted auto-installed models..."
+
+    local patterns=(
+        "*v1-5*pruned*emaonly*"
+        "*v1.5*pruned*emaonly*"
+        "*sd-v1-5*"
+    )
+    local removed=0
+    for pat in "${patterns[@]}"; do
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            log_info "Removing unwanted model: $(basename "$f")"
+            rm -f "$f"
+            (( removed++ )) || true
+        done < <(find "$checkpoints_dir" -maxdepth 1 -iname "$pat" -type f 2>/dev/null)
+    done
+
+    if [[ $removed -eq 0 ]]; then
+        log_info "No unwanted models found"
+    else
+        log_info "Removed ${removed} unwanted model(s)"
+    fi
+}
+
 # ==================== PACKAGE DEFINITIONS ====================
 
 APT_PACKAGES=(
@@ -647,6 +740,9 @@ function provisioning_start() {
     log_info "=========================================="
 
     install_download_tools
+
+    update_comfyui_if_needed
+    remove_unwanted_models
 
     setup_output_http_server
     fix_api_wrapper_timeout
