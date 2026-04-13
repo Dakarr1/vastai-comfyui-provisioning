@@ -582,6 +582,99 @@ function setup_tunnels_and_label() {
     fi
 }
 
+# ==================== COMFYUI VERSION CHECK + UPDATE ====================
+
+# Helper script written to disk to avoid quoting issues inside $()
+_CM_VERSION_SCRIPT="/tmp/_comfy_version_check.py"
+cat > "$_CM_VERSION_SCRIPT" << 'PYEOF_INNER'
+import sys, re
+try:
+    with open(sys.argv[1]) as f:
+        txt = f.read()
+    m = re.search(r'__version__\s*=\s*["\x27]([0-9]+\.[0-9]+\.?[0-9]*)', txt)
+    print(m.group(1) if m else '')
+except:
+    print('')
+PYEOF_INNER
+
+function update_comfyui_if_needed() {
+    local required_major=0 required_minor=17 required_patch=1
+    local cm_cli="${COMFYUI_DIR}/custom_nodes/ComfyUI-Manager/cm-cli.py"
+    local version_file="${COMFYUI_DIR}/comfy/version.py"
+
+    if [[ ! -f "$version_file" ]]; then
+        log_warning "ComfyUI version file not found — skipping version check"
+        return 0
+    fi
+
+    local version
+    version=$(python3 "$_CM_VERSION_SCRIPT" "$version_file" 2>/dev/null)
+
+    if [[ -z "$version" ]]; then
+        log_warning "Cannot parse ComfyUI version — skipping"
+        return 0
+    fi
+    log_info "ComfyUI version: ${version}"
+
+    local cur_major cur_minor cur_patch
+    IFS='.' read -r cur_major cur_minor cur_patch <<< "$version"
+    cur_major=$(safe_int "$cur_major")
+    cur_minor=$(safe_int "$cur_minor")
+    cur_patch=$(safe_int "${cur_patch:-0}")
+
+    local needs_update=false
+    if   [[ $cur_major -lt $required_major ]]; then needs_update=true
+    elif [[ $cur_major -eq $required_major && $cur_minor -lt $required_minor ]]; then needs_update=true
+    elif [[ $cur_major -eq $required_major && $cur_minor -eq $required_minor && $cur_patch -lt $required_patch ]]; then needs_update=true
+    fi
+
+    if [[ "$needs_update" == "false" ]]; then
+        log_info "✓ ComfyUI ${version} >= ${required_major}.${required_minor}.${required_patch} — no update needed"
+        return 0
+    fi
+
+    log_info "ComfyUI ${version} < ${required_major}.${required_minor}.${required_patch} — updating via ComfyUI-Manager..."
+
+    if [[ ! -f "$cm_cli" ]]; then
+        log_warning "cm-cli.py not found — cannot update via Manager"
+        return 0
+    fi
+
+    COMFYUI_PATH="${COMFYUI_DIR}" python3 "$cm_cli" update ComfyUI 2>&1 | tee -a "$PROVISION_LOG" || true
+
+    local new_version
+    new_version=$(python3 "$_CM_VERSION_SCRIPT" "$version_file" 2>/dev/null)
+    log_info "✓ ComfyUI updated to ${new_version:-unknown}"
+}
+
+# ==================== CLEANUP UNWANTED AUTO-INSTALLED MODELS ====================
+
+function remove_unwanted_models() {
+    local checkpoints_dir="${COMFYUI_DIR}/models/checkpoints"
+    log_info "Removing unwanted auto-installed models..."
+
+    local patterns=(
+        "*v1-5*pruned*emaonly*"
+        "*v1.5*pruned*emaonly*"
+        "*sd-v1-5*"
+    )
+    local removed=0
+    for pat in "${patterns[@]}"; do
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            log_info "Removing unwanted model: $(basename "$f")"
+            rm -f "$f"
+            (( removed++ )) || true
+        done < <(find "$checkpoints_dir" -maxdepth 1 -iname "$pat" -type f 2>/dev/null)
+    done
+
+    if [[ $removed -eq 0 ]]; then
+        log_info "No unwanted models found"
+    else
+        log_info "Removed ${removed} unwanted model(s)"
+    fi
+}
+
 # ==================== PACKAGE DEFINITIONS ====================
 
 APT_PACKAGES=(
@@ -596,37 +689,48 @@ PIP_PACKAGES=(
 NODES=(
     "https://github.com/diodiogod/TTS-Audio-Suite"
     "https://github.com/kijai/ComfyUI-KJNodes"
+    "https://github.com/rgthree/rgthree-comfy"
+    "https://github.com/pythongosssss/ComfyUI-Custom-Scripts"
+    "https://github.com/melMass/comfy_mtb"
+    "https://github.com/Lightricks/ComfyUI-LTXVideo"
+    "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
 )
 
 CHECKPOINT_MODELS=(
-    # LTX-2.3 main model (fp8)
-    "https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors"
+    # LTX-2.3 audio VAE (goes in checkpoints per Lightricks convention)
+    "https://huggingface.co/vantagewithai/LTX-2.3-Split/resolve/main/audio_vae/ltx-2-3-22b-audio_vae.safetensors"
 )
 UNET_MODELS=()
 
 LORA_MODELS=(
     # LTX-2.3 distilled lora
     "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors"
+    # LTX-2.3 transition lora
+    "https://huggingface.co/vantagewithai/LTX-2.3-Split/resolve/main/loras/ltx2.3-transition.safetensors"
     # Slimey character lora (private repo — requires HF_TOKEN)
     "https://huggingface.co/Eldaroo/slimey-lora/resolve/main/slimey_lora_v1_copy.safetensors"
 )
 
-# clip_vision: format "url|target_filename" (pipe separates URL from desired name)
 CLIP_VISION_MODELS=()
 
 VAE_MODELS=(
+    # LTX-2.3 VAE
+    "https://huggingface.co/vantagewithai/LTX-2.3-Split/resolve/main/vae/ltx-2-3-22b-VAE.safetensors"
     # Z-Image VAE
     "https://huggingface.co/Comfy-Org/z_image/resolve/main/split_files/vae/ae.safetensors"
 )
 
 TEXT_ENCODER_MODELS=(
-    # LTX-2.3 text encoder
-    "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+    # LTX-2.3 text encoders
+    "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it.safetensors"
+    "https://huggingface.co/vantagewithai/LTX-2.3-Split/resolve/main/text_encoder/ltx-2-3-22b-text_encoder.safetensors"
     # Z-Image text encoder
     "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
 )
 
 DIFFUSION_MODELS=(
+    # LTX-2.3 transformer (fp8 scaled)
+    "https://huggingface.co/Kijai/LTX2.3_comfy/resolve/main/diffusion_models/ltx-2.3-22b-dev_transformer_only_fp8_scaled.safetensors"
     # Z-Image diffusion model
     "https://huggingface.co/Comfy-Org/z_image/resolve/main/split_files/diffusion_models/z_image_bf16.safetensors"
 )
@@ -635,8 +739,8 @@ ESRGAN_MODELS=()
 
 CONTROLNET_MODELS=()
 LATENT_UPSCALE_MODELS=(
-    # LTX-2.3 spatial upscaler
-    "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+    # LTX-2.3 spatial upscaler v1.1
+    "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 )
 WORKFLOWS=()
 
@@ -648,6 +752,9 @@ function provisioning_start() {
     log_info "=========================================="
 
     install_download_tools
+
+    update_comfyui_if_needed
+    remove_unwanted_models
 
     setup_output_http_server
     fix_api_wrapper_timeout
@@ -668,6 +775,9 @@ function provisioning_start() {
     set_status_label "Provisioning:loras"
     provisioning_get_files "${COMFYUI_DIR}/models/loras"            "${LORA_MODELS[@]}"
 
+    set_status_label "Provisioning:clip_vision"
+    provisioning_get_clip_vision "${COMFYUI_DIR}/models/clip_vision" "${CLIP_VISION_MODELS[@]}"
+
     set_status_label "Provisioning:vae"
     provisioning_get_files "${COMFYUI_DIR}/models/vae"              "${VAE_MODELS[@]}"
 
@@ -677,8 +787,11 @@ function provisioning_start() {
     set_status_label "Provisioning:diffusion_models"
     provisioning_get_files "${COMFYUI_DIR}/models/diffusion_models" "${DIFFUSION_MODELS[@]}"
 
+    set_status_label "Provisioning:upscale_models"
+    provisioning_get_files "${COMFYUI_DIR}/models/upscale_models"   "${ESRGAN_MODELS[@]}"
+
     set_status_label "Provisioning:latent_upscale_models"
-    provisioning_get_files "${COMFYUI_DIR}/models/upscale_models"   "${LATENT_UPSCALE_MODELS[@]}"
+    provisioning_get_files "${COMFYUI_DIR}/models/latent"           "${LATENT_UPSCALE_MODELS[@]}"
 
     set_status_label "Provisioning:scanning_models"
     cleanup_corrupted_files "${COMFYUI_DIR}/models"
