@@ -791,7 +791,7 @@ function provisioning_start() {
     provisioning_get_files "${COMFYUI_DIR}/models/upscale_models"   "${ESRGAN_MODELS[@]}"
 
     set_status_label "Provisioning:latent_upscale_models"
-    provisioning_get_files "${COMFYUI_DIR}/models/latent"           "${LATENT_UPSCALE_MODELS[@]}"
+    provisioning_get_files "${COMFYUI_DIR}/models/latent_upscale_models"           "${LATENT_UPSCALE_MODELS[@]}"
 
     set_status_label "Provisioning:scanning_models"
     cleanup_corrupted_files "${COMFYUI_DIR}/models"
