@@ -584,38 +584,43 @@ function setup_tunnels_and_label() {
 
 # ==================== COMFYUI VERSION CHECK + UPDATE ====================
 
-# Helper script written to disk to avoid quoting issues inside $()
-_CM_VERSION_SCRIPT="/tmp/_comfy_version_check.py"
-cat > "$_CM_VERSION_SCRIPT" << 'PYEOF_INNER'
-import sys, re
-try:
-    with open(sys.argv[1]) as f:
-        txt = f.read()
-    m = re.search(r'__version__\s*=\s*["\x27]([0-9]+\.[0-9]+\.?[0-9]*)', txt)
-    print(m.group(1) if m else '')
-except:
-    print('')
-PYEOF_INNER
-
 function update_comfyui_if_needed() {
     local required_major=0 required_minor=17 required_patch=1
-    local cm_cli="${COMFYUI_DIR}/custom_nodes/ComfyUI-Manager/cm-cli.py"
-    local version_file="${COMFYUI_DIR}/comfy/version.py"
+    local version_file="${COMFYUI_DIR}/comfyui_version.py"
 
+    # ── Read current version ──────────────────────────────────────
     if [[ ! -f "$version_file" ]]; then
-        log_warning "ComfyUI version file not found — skipping version check"
+        log_warning "comfyui_version.py not found at ${COMFYUI_DIR} — skipping update check"
         return 0
     fi
 
     local version
-    version=$(python3 "$_CM_VERSION_SCRIPT" "$version_file" 2>/dev/null)
+    version=$(python3 - "$version_file" << 'PYEOF_INNER'
+import sys, re
+try:
+    with open(sys.argv[1]) as f:
+        txt = f.read()
+    # Match: __version__ = "0.17.1" or version = "0.17.1" etc.
+    m = re.search(r'["\x27]([0-9]+\.[0-9]+\.?[0-9]*)["\x27]', txt)
+    print(m.group(1) if m else '')
+except:
+    print('')
+PYEOF_INNER
+)
 
     if [[ -z "$version" ]]; then
-        log_warning "Cannot parse ComfyUI version — skipping"
+        # Fallback: try git log — vastai/comfy embeds version in commit message
+        version=$(git -C "${COMFYUI_DIR}" log -1 --oneline 2>/dev/null \
+                  | grep -oP '[0-9]+\.[0-9]+\.?[0-9]*' | head -1)
+    fi
+
+    if [[ -z "$version" ]]; then
+        log_warning "Cannot determine ComfyUI version — skipping update check"
         return 0
     fi
     log_info "ComfyUI version: ${version}"
 
+    # ── Compare versions ──────────────────────────────────────────
     local cur_major cur_minor cur_patch
     IFS='.' read -r cur_major cur_minor cur_patch <<< "$version"
     cur_major=$(safe_int "$cur_major")
@@ -633,18 +638,42 @@ function update_comfyui_if_needed() {
         return 0
     fi
 
-    log_info "ComfyUI ${version} < ${required_major}.${required_minor}.${required_patch} — updating via ComfyUI-Manager..."
+    log_info "ComfyUI ${version} < ${required_major}.${required_minor}.${required_patch} — updating..."
 
-    if [[ ! -f "$cm_cli" ]]; then
-        log_warning "cm-cli.py not found — cannot update via Manager"
+    # ── Git update ────────────────────────────────────────────────
+    if [[ ! -d "${COMFYUI_DIR}/.git" ]]; then
+        log_warning "COMFYUI_DIR is not a git repo — cannot update"
         return 0
     fi
 
-    COMFYUI_PATH="${COMFYUI_DIR}" python3 "$cm_cli" update ComfyUI 2>&1 | tee -a "$PROVISION_LOG" || true
+    # Fetch latest, then reset --hard to avoid dirty-tree failures
+    local default_branch
+    default_branch=$(git -C "${COMFYUI_DIR}" remote show origin 2>/dev/null \
+                     | grep 'HEAD branch' | awk '{print $NF}')
+    [[ -z "$default_branch" ]] && default_branch="master"
+    log_info "Updating branch: ${default_branch}"
 
+    git -C "${COMFYUI_DIR}" fetch --all --tags 2>&1 | tee -a "$PROVISION_LOG"
+    git -C "${COMFYUI_DIR}" reset --hard "origin/${default_branch}" 2>&1 | tee -a "$PROVISION_LOG"
+
+    # Re-install requirements after update
+    log_info "Reinstalling ComfyUI requirements..."
+    pip install -r "${COMFYUI_DIR}/requirements.txt" 2>&1 | tee -a "$PROVISION_LOG"
+
+    # ── Verify update ─────────────────────────────────────────────
     local new_version
-    new_version=$(python3 "$_CM_VERSION_SCRIPT" "$version_file" 2>/dev/null)
-    log_info "✓ ComfyUI updated to ${new_version:-unknown}"
+    new_version=$(python3 - "$version_file" << 'PYEOF_INNER'
+import sys, re
+try:
+    with open(sys.argv[1]) as f:
+        txt = f.read()
+    m = re.search(r'["\x27]([0-9]+\.[0-9]+\.?[0-9]*)["\x27]', txt)
+    print(m.group(1) if m else 'unknown')
+except:
+    print('unknown')
+PYEOF_INNER
+)
+    log_info "✓ ComfyUI updated: ${version} → ${new_version}"
 }
 
 # ==================== CLEANUP UNWANTED AUTO-INSTALLED MODELS ====================
